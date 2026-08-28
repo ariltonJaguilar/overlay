@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <cwctype>
 
 namespace {
 constexpr wchar_t kWindowClass[] = L"GameOverlayMvp.Window";
@@ -22,10 +23,11 @@ constexpr BYTE kPanelBlue = 28;
 constexpr int kVolumePanelWidth = 620;
 constexpr int kVolumePanelRadius = 28;
 constexpr int kSliderHalfWidth = 210;
-constexpr int kAchievementPanelWidth = 760;
+constexpr int kAchievementPanelWidth = 920;
+constexpr int kAchievementCardHalfWidth = 450;
 constexpr int kAchievementListTop = 92;
-constexpr int kAchievementRowHeight = 150;
-constexpr int kAchievementCardHeight = 142;
+constexpr int kAchievementRowHeight = 112;
+constexpr int kAchievementCardHeight = 104;
 
 struct WindowSearch {
     DWORD pid;
@@ -41,6 +43,66 @@ BOOL CALLBACK findGameWindow(HWND window, LPARAM parameter) {
         return FALSE;
     }
     return TRUE;
+}
+
+bool isSteamWindowProcess(HWND window) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+
+    wchar_t path[32768]{};
+    DWORD length = static_cast<DWORD>(std::size(path));
+    const BOOL queried = QueryFullProcessImageNameW(process, 0, path, &length);
+    CloseHandle(process);
+    if (!queried) return false;
+
+    std::wstring executable = std::filesystem::path(std::wstring(path, length)).filename().wstring();
+    std::transform(executable.begin(), executable.end(), executable.begin(),
+                   [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+    return executable == L"steam.exe" || executable == L"steamwebhelper.exe";
+}
+
+struct SteamWindowSearch {
+    HWND bigPicture = nullptr;
+    HWND fallback = nullptr;
+};
+
+BOOL CALLBACK findSteamWindow(HWND window, LPARAM parameter) {
+    auto* search = reinterpret_cast<SteamWindowSearch*>(parameter);
+    if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) != nullptr ||
+        !isSteamWindowProcess(window)) return TRUE;
+
+    wchar_t title[512]{};
+    GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+    std::wstring normalizedTitle(title);
+    std::transform(normalizedTitle.begin(), normalizedTitle.end(), normalizedTitle.begin(),
+                   [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+    if (normalizedTitle.find(L"big picture") != std::wstring::npos) {
+        search->bigPicture = window;
+        return FALSE;
+    }
+    if (!search->fallback && !normalizedTitle.empty()) search->fallback = window;
+    return TRUE;
+}
+
+bool focusSteamBigPicture() {
+    SteamWindowSearch search{};
+    EnumWindows(findSteamWindow, reinterpret_cast<LPARAM>(&search));
+    const HWND steamWindow = search.bigPicture ? search.bigPicture : search.fallback;
+    if (!steamWindow) return false;
+
+    if (IsIconic(steamWindow)) ShowWindow(steamWindow, SW_RESTORE);
+    const HWND foreground = GetForegroundWindow();
+    const DWORD currentThread = GetCurrentThreadId();
+    const DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(currentThread, foregroundThread, TRUE);
+    BringWindowToTop(steamWindow);
+    const bool focused = SetForegroundWindow(steamWindow) != FALSE;
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(currentThread, foregroundThread, FALSE);
+    return focused;
 }
 
 void drawAchievementIcon(HDC dc, int x, int y, COLORREF color) {
@@ -501,10 +563,34 @@ void OverlayWindow::executeSettingsAction() {
                           SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_FLAG_PLANNED);
         }
     } else {
+        prepareForGameExit();
         WindowSearch search{gamePid_, nullptr};
         EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&search));
         if (search.result) PostMessageW(search.result, WM_CLOSE, 0, 0);
     }
+}
+
+void OverlayWindow::prepareForGameExit() {
+    closingGame_ = true;
+    enabled_ = false;
+    shown_ = false;
+    draggingVolume_ = false;
+    ReleaseCapture();
+    setGameInputBlocked(false);
+    ShowWindow(window_, SW_HIDE);
+    blurredBackground_.clear();
+
+    // O hook deixa de ser necessario neste ponto. Remove-lo imediatamente
+    // garante que teclado e atalhos do shell nao dependam do fim do jogo.
+    if (keyboardHook_) {
+        UnhookWindowsHookEx(keyboardHook_);
+        keyboardHook_ = nullptr;
+    }
+    // Deixe a propria Steam restaurar/ativar o Big Picture. A interface atual
+    // vive em steamwebhelper.exe e nem sempre expoe um HWND principal enumeravel.
+    ShellExecuteW(window_, L"open", L"steam://open/bigpicture", nullptr, nullptr, SW_SHOWNORMAL);
+    focusSteamBigPicture();
+    nextSteamFocusAttempt_ = GetTickCount64() + 100;
 }
 
 bool OverlayWindow::initializeSystemVolume() {
@@ -792,8 +878,10 @@ void OverlayWindow::draw(HDC dc) const {
             for (int visible = 0; visible < visibleCount && first + visible < count; ++visible) {
                 const int position = first + visible;
                 const auto& achievement = achievementState_->achievements[filtered[position]];
-                RECT row{width / 2 - 370, kAchievementListTop + visible * kAchievementRowHeight,
-                         width / 2 + 370, kAchievementListTop + kAchievementCardHeight +
+                RECT row{width / 2 - kAchievementCardHalfWidth,
+                         kAchievementListTop + visible * kAchievementRowHeight,
+                         width / 2 + kAchievementCardHalfWidth,
+                         kAchievementListTop + kAchievementCardHeight +
                              visible * kAchievementRowHeight};
                 SetTextColor(dc, achievement.unlocked ? RGB(250, 250, 252) : RGB(145, 147, 154));
                 if (achievement.iconWidth <= 0) {
@@ -808,20 +896,35 @@ void OverlayWindow::draw(HDC dc) const {
                 std::wstring description = conceal
                     ? L"Os detalhes desta conquista est\u00e3o ocultos"
                     : fromUtf8(achievement.description);
-                RECT nameRect{row.left + 105, row.top + 10, row.right - 18, row.top + 72};
+                RECT nameRect{row.left + 105, row.top + 11, row.right - 18, row.top + 47};
                 SelectObject(dc, nameFont);
                 DrawTextW(dc, name.c_str(), -1, &nameRect,
-                          DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
                 SetTextColor(dc, achievement.unlocked ? RGB(195, 197, 204) : RGB(115, 117, 124));
-                RECT descRect{row.left + 105, row.top + 74, row.right - 18,
-                              row.bottom - (achievement.hasProgress ? 23 : 10)};
+                RECT descRect{row.left + 105, row.top + 48, row.right - 18,
+                              row.top + 82};
                 SelectObject(dc, descriptionFont);
                 DrawTextW(dc, description.c_str(), -1, &descRect,
-                          DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
                 if (achievement.hasProgress && achievement.progressMaximum > 0) {
-                    const int progressLeft = row.left + 105;
+                    const std::wstring progressText =
+                        std::to_wstring(achievement.progressCurrent) + L"/" +
+                        std::to_wstring(achievement.progressMaximum);
+                    SelectObject(dc, descriptionFont);
+                    SetTextColor(dc, achievement.unlocked ? RGB(195, 197, 204)
+                                                           : RGB(145, 147, 154));
+                    SIZE progressTextSize{};
+                    GetTextExtentPoint32W(dc, progressText.c_str(),
+                                          static_cast<int>(progressText.size()),
+                                          &progressTextSize);
+                    const int progressLabelLeft = row.left + 105;
+                    const int progressLeft = progressLabelLeft + progressTextSize.cx + 10;
                     const int progressRight = row.right - 18;
                     const int progressTop = row.bottom - 15;
+                    RECT progressLabel{progressLabelLeft, progressTop - 10,
+                                       progressLeft - 10, progressTop + 17};
+                    DrawTextW(dc, progressText.c_str(), -1, &progressLabel,
+                              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
                     HBRUSH track = CreateSolidBrush(RGB(82, 84, 91));
                     SelectObject(dc, track);
                     RoundRect(dc, progressLeft, progressTop, progressRight, progressTop + 7, 7, 7);
@@ -1040,8 +1143,8 @@ void OverlayWindow::drawAchievementImages(std::uint32_t* destination, int destin
     for (int visible = 0; visible < visibleCount && first + visible < count; ++visible) {
         const auto& achievement = achievementState_->achievements[filtered[first + visible]];
         if (achievement.iconWidth != 64 || achievement.iconHeight != 64) continue;
-        const int left = destinationWidth / 2 - 352;
-        const int top = kAchievementListTop + 39 + visible * kAchievementRowHeight;
+        const int left = destinationWidth / 2 - kAchievementCardHalfWidth + 18;
+        const int top = kAchievementListTop + 20 + visible * kAchievementRowHeight;
         // A Steam ja devolve a variante correta (conquistada ou bloqueada).
         // Nao altere cor, brilho ou opacidade da imagem recebida.
         constexpr BYTE opacity = 255;
@@ -1198,8 +1301,8 @@ void OverlayWindow::renderAndPresent() {
         const int first = std::clamp(achievementSelection_ - visibleCount / 2, 0,
                                      (std::max)(0, count - visibleCount));
         const int visible = achievementSelection_ - first;
-        const int left = frameWidth_ / 2 - 370;
-        const int right = frameWidth_ / 2 + 370;
+        const int left = frameWidth_ / 2 - kAchievementCardHalfWidth;
+        const int right = frameWidth_ / 2 + kAchievementCardHalfWidth;
         const int top = kAchievementListTop + visible * kAchievementRowHeight;
         const int bottom = kAchievementListTop + kAchievementCardHeight +
                            visible * kAchievementRowHeight;
@@ -1343,7 +1446,14 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     case WM_TIMER:
         if (self && wParam == kProcessTimerId) {
             if (WaitForSingleObject(self->gameProcess_, 0) == WAIT_OBJECT_0) {
+                if (self->closingGame_) focusSteamBigPicture();
                 DestroyWindow(window);
+            } else if (self->closingGame_) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= self->nextSteamFocusAttempt_) {
+                    focusSteamBigPicture();
+                    self->nextSteamFocusAttempt_ = now + 250;
+                }
             } else {
                 self->syncVisibilityWithGame();
                 self->pollController();

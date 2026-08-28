@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cctype>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -175,6 +176,38 @@ bool alreadyHooked(void* target) {
     return false;
 }
 
+FARPROC newestVersionedExport(HMODULE module, const char* prefix) {
+    if (!module || !prefix) return nullptr;
+    const auto* base = reinterpret_cast<const unsigned char*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!directory.VirtualAddress || !directory.Size) return nullptr;
+    const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+        base + directory.VirtualAddress);
+    const auto* names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+    const size_t prefixLength = std::strlen(prefix);
+    unsigned long newestVersion = 0;
+    const char* newestName = nullptr;
+    for (DWORD index = 0; index < exports->NumberOfNames; ++index) {
+        const char* name = reinterpret_cast<const char*>(base + names[index]);
+        if (std::strncmp(name, prefix, prefixLength) != 0) continue;
+        const char* versionText = name + prefixLength;
+        if (!*versionText || !std::all_of(versionText, versionText + std::strlen(versionText),
+                                           [](unsigned char value) { return std::isdigit(value) != 0; })) {
+            continue;
+        }
+        const unsigned long version = std::strtoul(versionText, nullptr, 10);
+        if (!newestName || version > newestVersion) {
+            newestVersion = version;
+            newestName = name;
+        }
+    }
+    return newestName ? GetProcAddress(module, newestName) : nullptr;
+}
+
 void hookTarget(void* target) {
     if (!target || alreadyHooked(target) || g_hookCount >= kMaximumHooks) return;
     const size_t slot = g_hookCount;
@@ -219,16 +252,20 @@ void collectSteamAchievements() {
     using GetAppIdFn = unsigned int(__cdecl*)(void*);
     using GetStatIntFn = bool(__cdecl*)(void*, const char*, int*);
 
-    for (int attempt = 0; attempt < 30; ++attempt) {
+    // Jogos de 32 bits carregam steam_api.dll; os de 64 bits normalmente usam
+    // steam_api64.dll. O hook existe nas duas arquiteturas, portanto nao presuma
+    // o nome da DLL aqui.
+    for (int attempt = 0; attempt < 120; ++attempt) {
         HMODULE steam = GetModuleHandleW(L"steam_api64.dll");
+        if (!steam) steam = GetModuleHandleW(L"steam_api.dll");
         if (!steam) {
             Sleep(1000);
             continue;
         }
         auto getInterface = reinterpret_cast<GetInterfaceFn>(
-            GetProcAddress(steam, "SteamAPI_SteamUserStats_v012"));
+            newestVersionedExport(steam, "SteamAPI_SteamUserStats_v"));
         if (!getInterface) getInterface = reinterpret_cast<GetInterfaceFn>(
-            GetProcAddress(steam, "SteamAPI_SteamUserStats_v011"));
+            GetProcAddress(steam, "SteamUserStats"));
         auto getCount = reinterpret_cast<GetCountFn>(
             GetProcAddress(steam, "SteamAPI_ISteamUserStats_GetNumAchievements"));
         auto getName = reinterpret_cast<GetNameFn>(
@@ -240,9 +277,9 @@ void collectSteamAchievements() {
         auto getIcon = reinterpret_cast<GetIconFn>(
             GetProcAddress(steam, "SteamAPI_ISteamUserStats_GetAchievementIcon"));
         auto getUtils = reinterpret_cast<GetInterfaceFn>(
-            GetProcAddress(steam, "SteamAPI_SteamUtils_v010"));
+            newestVersionedExport(steam, "SteamAPI_SteamUtils_v"));
         if (!getUtils) getUtils = reinterpret_cast<GetInterfaceFn>(
-            GetProcAddress(steam, "SteamAPI_SteamUtils_v009"));
+            GetProcAddress(steam, "SteamUtils"));
         auto getImageSize = reinterpret_cast<GetImageSizeFn>(
             GetProcAddress(steam, "SteamAPI_ISteamUtils_GetImageSize"));
         auto getImageRgba = reinterpret_cast<GetImageRgbaFn>(

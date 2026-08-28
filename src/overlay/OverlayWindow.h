@@ -41,6 +41,7 @@ private:
     void adjustVolume(int direction);
     void setVolumeFromMouse(int x);
     void executeSettingsAction();
+    void prepareForGameExit();
     void draw(HDC dc) const;
     bool captureAndBlurBackground();
     void renderAndPresent();
@@ -80,6 +81,8 @@ private:
     IAudioEndpointVolume* endpointVolume_ = nullptr;
     float volumeLevel_ = 0.0f;
     bool draggingVolume_ = false;
+    bool closingGame_ = false;
+    ULONGLONG nextSteamFocusAttempt_ = 0;
     WORD previousControllerButtons_[XUSER_MAX_COUNT]{};
     IGameInput* gameInput_ = nullptr;
     GameInputGamepadButtons previousGameInputButtons_ = GameInputGamepadNone;

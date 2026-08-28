@@ -7,6 +7,7 @@
 #include <tlhelp32.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -83,6 +84,7 @@ constexpr int kListId = 100;
 constexpr int kNameId = 101;
 constexpr int kAddId = 102;
 constexpr int kRemoveId = 103;
+constexpr int kSearchId = 104;
 constexpr COLORREF kBackground = RGB(20, 20, 23);
 constexpr COLORREF kCard = RGB(31, 31, 35);
 constexpr COLORREF kSurface = RGB(43, 43, 48);
@@ -96,8 +98,11 @@ HBRUSH gSurfaceBrush = nullptr;
 
 std::filesystem::path uiBlacklistPath() { return executableDirectory() / L"overlay-blacklist.txt"; }
 
-void refreshBlacklistList(HWND window) {
+void refreshBlacklistList(HWND window, int topIndex = -1) {
     const HWND list = GetDlgItem(window, kListId);
+    wchar_t searchBuffer[512]{};
+    GetWindowTextW(GetDlgItem(window, kSearchId), searchBuffer, static_cast<int>(std::size(searchBuffer)));
+    const std::wstring search = lower(trim(searchBuffer));
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
     std::wistringstream input(readUtf8Text(uiBlacklistPath()));
     std::wstring line;
@@ -105,7 +110,16 @@ void refreshBlacklistList(HWND window) {
         const std::wstring entry = trim(line);
         if (!entry.empty() && !entry.starts_with(L"#")) {
             const std::wstring display = entry.starts_with(L"game=") ? entry.substr(5) : entry;
-            SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(display.c_str()));
+            if (search.empty() || lower(display).find(search) != std::wstring::npos) {
+                SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(display.c_str()));
+            }
+        }
+    }
+    if (topIndex >= 0) {
+        const LRESULT count = SendMessageW(list, LB_GETCOUNT, 0, 0);
+        if (count > 0) {
+            const int restoredIndex = static_cast<int>(std::min<LRESULT>(topIndex, count - 1));
+            SendMessageW(list, LB_SETTOPINDEX, restoredIndex, 0);
         }
     }
 }
@@ -122,6 +136,7 @@ void appendGameToBlacklist(HWND window) {
 
 void removeSelectedBlacklistEntry(HWND window) {
     const HWND list = GetDlgItem(window, kListId);
+    const LRESULT topIndex = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
     const LRESULT selection = SendMessageW(list, LB_GETCURSEL, 0, 0);
     if (selection == LB_ERR) return;
     const LRESULT length = SendMessageW(list, LB_GETTEXTLEN, selection, 0);
@@ -140,7 +155,7 @@ void removeSelectedBlacklistEntry(HWND window) {
     std::wstring updated;
     for (const auto& savedLine : lines) updated += savedLine + L"\n";
     writeUtf8Text(uiBlacklistPath(), updated, false);
-    refreshBlacklistList(window);
+    refreshBlacklistList(window, topIndex == LB_ERR ? -1 : static_cast<int>(topIndex));
 }
 
 void addTrayIcon(HWND window) {
@@ -173,7 +188,11 @@ LRESULT CALLBACK managerWindowProc(HWND window, UINT message, WPARAM wParam, LPA
         gTitleFont = CreateFontW(-30, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Display");
         HWND list = CreateWindowW(L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL,
-                      32, 128, 616, 314, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)), nullptr, nullptr);
+                      32, 144, 616, 298, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)), nullptr, nullptr);
+        HWND search = CreateWindowW(L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                      32, 108, 616, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchId)), nullptr, nullptr);
+        SendMessageW(search, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Buscar na lista"));
+        SendMessageW(search, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(8, 8));
         HWND edit = CreateWindowW(L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                       44, 482, 410, 24, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNameId)), nullptr, nullptr);
         SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Nome do jogo"));
@@ -230,16 +249,18 @@ LRESULT CALLBACK managerWindowProc(HWND window, UINT message, WPARAM wParam, LPA
         SetTextColor(dc, kMuted); SelectObject(dc, gUiFont);
         const wchar_t* subtitle = L"Jogos protegidos não recebem overlay nem injeção.";
         TextOutW(dc, 32, 72, subtitle, lstrlenW(subtitle));
-        RECT card{24, 116, 656, 450}; HBRUSH cardBrush = CreateSolidBrush(kCard); HPEN cardPen = CreatePen(PS_SOLID, 1, RGB(52,52,58));
+        RECT card{24, 100, 656, 450}; HBRUSH cardBrush = CreateSolidBrush(kCard); HPEN cardPen = CreatePen(PS_SOLID, 1, RGB(52,52,58));
         SelectObject(dc, cardBrush); SelectObject(dc, cardPen); RoundRect(dc, card.left, card.top, card.right, card.bottom, 16, 16);
         HBRUSH inputBrush = CreateSolidBrush(kSurface); HPEN inputPen = CreatePen(PS_SOLID, 1, RGB(67,67,74));
         SelectObject(dc, inputBrush); SelectObject(dc, inputPen); RoundRect(dc, 32, 474, 466, 514, 12, 12);
+        RoundRect(dc, 32, 108, 648, 136, 10, 10);
         DeleteObject(cardBrush); DeleteObject(cardPen); DeleteObject(inputBrush); DeleteObject(inputPen);
         EndPaint(window, &paint); return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wParam) == kAddId) appendGameToBlacklist(window);
         else if (LOWORD(wParam) == kRemoveId) removeSelectedBlacklistEntry(window);
+        else if (LOWORD(wParam) == kSearchId && HIWORD(wParam) == EN_CHANGE) refreshBlacklistList(window);
         return 0;
     case kTrayMessage:
         if (lParam == WM_LBUTTONUP) {
