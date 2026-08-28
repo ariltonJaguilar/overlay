@@ -259,7 +259,7 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
     windowClass.hInstance = instance;
     windowClass.lpfnWndProc = windowProc;
     windowClass.lpszClassName = kWindowClass;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     windowClass.hbrBackground = nullptr;
     RegisterClassExW(&windowClass);
 
@@ -493,7 +493,7 @@ void OverlayWindow::executeSettingsAction() {
         TOKEN_PRIVILEGES privileges{};
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
             privileges.PrivilegeCount = 1;
-            LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &privileges.Privileges[0].Luid);
+            LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &privileges.Privileges[0].Luid);
             privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
             CloseHandle(token);

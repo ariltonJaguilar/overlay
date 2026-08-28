@@ -29,7 +29,7 @@ MVP nativo para Windows que detecta jogos instalados pela Steam, inicia um overl
 
 - O overlay inicia escondido. `Ctrl+Shift+O` abre uma barra próxima à parte inferior da tela e devolve o foco ao jogo quando ela fecha.
 - A barra contém `Conquistas`, `Volume` e `Configurações`. Navegue com setas/D-pad/analógico esquerdo, use `Enter`/`A` para selecionar e `Esc`/`B` para fechar.
-- `GameOverlayManager.exe` injeta `OverlayInputHook.dll` no processo 64-bit do jogo usando `LoadLibraryW`.
+- Para jogos 64-bit, `GameOverlayManager.exe` injeta `OverlayInputHook.dll` diretamente usando `LoadLibraryW`. Para jogos 32-bit, ele detecta o processo WOW64 e inicia `GameOverlayInjector32.exe`, que injeta `OverlayInputHook32.dll` compilada para a mesma arquitetura.
 - Overlay e DLL compartilham o estado aberto/fechado por uma seção de memória nomeada. Enquanto a barra está aberta, o hook de `XInputGetState` devolve um controle neutro ao jogo; o overlay continua lendo o controle físico.
 - Este primeiro hook cobre jogos que importam `XInputGetState` pelo executável principal. DirectInput, Raw Input, GameInput, imports em DLLs do jogo e carregamento dinâmico de XInput ainda não são interceptados.
 
@@ -42,18 +42,27 @@ Pré-requisitos: Visual Studio 2022 Build Tools (carga de trabalho **Desktop dev
 Em um **Developer PowerShell for VS 2022**, na raiz do projeto:
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Release
+.\build-all.ps1
 ```
 
-Os executáveis ficam normalmente em `build\Release\` e devem permanecer juntos.
+Se `cmake` não estiver no `PATH`, use o executável incluído no Visual Studio Build Tools:
+
+```powershell
+$cmakeBin = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'
+$env:Path = "$cmakeBin;$env:Path"
+cmake --build build-x64 --config Release
+```
+
+O pacote final fica em `build-x64\Release\`. Os arquivos `OverlayInputHook32.dll` e
+`GameOverlayInjector32.exe` são obrigatórios para jogos 32-bit e devem permanecer ao lado
+de `GameOverlayManager.exe`, `Overlay.exe` e `OverlayInputHook.dll`.
 
 ## Testar no modo Steam
 
 Inicie o manager sem argumentos e depois abra qualquer jogo instalado pela Steam:
 
 ```powershell
-.\build\Release\GameOverlayManager.exe
+.\build-x64\Release\GameOverlayManager.exe
 ```
 
 O console informa quantas instalações foram encontradas e exibe nome, AppID e PID quando reconhecer o jogo. O overlay aparece quando a janela do jogo entra em primeiro plano.
@@ -63,7 +72,7 @@ O console informa quantas instalações foram encontradas e exibe nome, AppID e 
 Use qualquer programa conhecido como alvo; por exemplo, o Bloco de Notas atual (`notepad.exe`):
 
 ```powershell
-.\build\Release\GameOverlayManager.exe --process notepad.exe
+.\build-x64\Release\GameOverlayManager.exe --process notepad.exe
 ```
 
 1. Com o alvo fechado, confirme que nenhum overlay aparece.
