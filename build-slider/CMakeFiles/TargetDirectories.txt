@@ -1,0 +1,9 @@
+E:/Desktop/overlay/build-slider/CMakeFiles/GameOverlayManager.dir
+E:/Desktop/overlay/build-slider/CMakeFiles/Overlay.dir
+E:/Desktop/overlay/build-slider/CMakeFiles/OverlayInputHook.dir
+E:/Desktop/overlay/build-slider/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-slider/CMakeFiles/ALL_BUILD.dir
+E:/Desktop/overlay/build-slider/CMakeFiles/ZERO_CHECK.dir
+E:/Desktop/overlay/build-slider/third_party/minhook/CMakeFiles/minhook.dir
+E:/Desktop/overlay/build-slider/third_party/minhook/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-slider/third_party/minhook/CMakeFiles/ALL_BUILD.dir

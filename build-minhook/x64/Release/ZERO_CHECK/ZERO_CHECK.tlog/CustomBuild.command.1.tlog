@@ -1,0 +1,10 @@
+^E:\DESKTOP\OVERLAY\BUILD-MINHOOK\CMAKEFILES\914B09C695889104C8CC05BC75694AEB\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SE:/Desktop/overlay -BE:/Desktop/overlay/build-minhook --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Desktop/overlay/build-minhook/GameOverlayMvp.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

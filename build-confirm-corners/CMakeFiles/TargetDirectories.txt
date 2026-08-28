@@ -1,0 +1,9 @@
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/GameOverlayManager.dir
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/Overlay.dir
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/OverlayInputHook.dir
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/ALL_BUILD.dir
+E:/Desktop/overlay/build-confirm-corners/CMakeFiles/ZERO_CHECK.dir
+E:/Desktop/overlay/build-confirm-corners/third_party/minhook/CMakeFiles/minhook.dir
+E:/Desktop/overlay/build-confirm-corners/third_party/minhook/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-confirm-corners/third_party/minhook/CMakeFiles/ALL_BUILD.dir

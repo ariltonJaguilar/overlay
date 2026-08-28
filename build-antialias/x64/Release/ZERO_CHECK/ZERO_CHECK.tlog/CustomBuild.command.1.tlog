@@ -1,0 +1,10 @@
+^E:\DESKTOP\OVERLAY\BUILD-ANTIALIAS\CMAKEFILES\8B3C9A1CA78C811786339848BA69F6EF\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SE:/Desktop/overlay -BE:/Desktop/overlay/build-antialias --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Desktop/overlay/build-antialias/GameOverlayMvp.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

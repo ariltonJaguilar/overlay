@@ -1,0 +1,10 @@
+^E:\DESKTOP\OVERLAY\BUILD-VERIFY\CMAKEFILES\570675A13E9EC15275479C6D433774F4\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SE:/Desktop/overlay -BE:/Desktop/overlay/build-verify --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Desktop/overlay/build-verify/GameOverlayMvp.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
