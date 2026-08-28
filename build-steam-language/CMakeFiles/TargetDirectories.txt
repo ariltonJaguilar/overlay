@@ -1,0 +1,9 @@
+E:/Desktop/overlay/build-steam-language/CMakeFiles/GameOverlayManager.dir
+E:/Desktop/overlay/build-steam-language/CMakeFiles/Overlay.dir
+E:/Desktop/overlay/build-steam-language/CMakeFiles/OverlayInputHook.dir
+E:/Desktop/overlay/build-steam-language/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-steam-language/CMakeFiles/ALL_BUILD.dir
+E:/Desktop/overlay/build-steam-language/CMakeFiles/ZERO_CHECK.dir
+E:/Desktop/overlay/build-steam-language/third_party/minhook/CMakeFiles/minhook.dir
+E:/Desktop/overlay/build-steam-language/third_party/minhook/CMakeFiles/INSTALL.dir
+E:/Desktop/overlay/build-steam-language/third_party/minhook/CMakeFiles/ALL_BUILD.dir

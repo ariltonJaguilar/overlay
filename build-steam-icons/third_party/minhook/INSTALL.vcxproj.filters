@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\Desktop\overlay\build-steam-icons\CMakeFiles\877a2b96a6078978f537686b9b59e748\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{DC370D1A-EF97-3245-B9BC-1B9C5A02C463}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

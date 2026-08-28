@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\Desktop\overlay\build-wrapped-achievements\CMakeFiles\24f48bdafef0291fdc63aa43bce3e259\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{88848CD9-52FB-351A-B5C6-EE1482757FA9}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,10 @@
+^E:\DESKTOP\OVERLAY\BUILD-ACHIEVEMENT-ICONS\CMAKEFILES\C23104EACBBEA7D92C02AB21C9F4DCFE\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SE:/Desktop/overlay -BE:/Desktop/overlay/build-achievement-icons --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/Desktop/overlay/build-achievement-icons/GameOverlayMvp.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

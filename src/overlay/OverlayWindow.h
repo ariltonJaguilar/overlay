@@ -6,6 +6,7 @@
 #include <endpointvolume.h>
 
 #include "InputShared.h"
+#include "AchievementShared.h"
 
 #include <cstdint>
 #include <vector>
@@ -30,7 +31,7 @@ private:
     void applyVisualStyle();
     void toggleVisibility();
     void syncVisibilityWithGame();
-    void centerOnGameMonitor() const;
+    void centerOnGameMonitor();
     void setGameInputBlocked(bool blocked);
     void pollController();
     void moveSelection(int direction);
@@ -48,18 +49,32 @@ private:
     void blendIcon(std::uint32_t* destination, int destinationWidth,
                    const IconImage& icon, int centerX, int centerY, BYTE opacity) const;
     void drawVolumeSlider(std::uint32_t* destination, int destinationWidth) const;
+    void drawAchievementImages(std::uint32_t* destination, int destinationWidth) const;
+    int barTop() const;
+    int menuOffset() const;
+    int sliderY() const;
+    int achievementVisibleCount() const;
+    std::vector<int> filteredAchievementIndices() const;
+    void cycleAchievementFilter();
+    void toggleHiddenAchievementDetails();
 
     HWND window_ = nullptr;
     HHOOK keyboardHook_ = nullptr;
     HANDLE gameProcess_ = nullptr;
     HANDLE sharedMapping_ = nullptr;
     InputSharedState* sharedState_ = nullptr;
+    HANDLE achievementMapping_ = nullptr;
+    AchievementSharedState* achievementState_ = nullptr;
     DWORD gamePid_ = 0;
     bool enabled_ = false;
     bool shown_ = false;
     bool systemBackdrop_ = false;
     int selectedItem_ = 0;
-    enum class Screen { MainBar, Volume, Settings, Confirmation } screen_ = Screen::MainBar;
+    enum class Screen { MainBar, Volume, Achievements, Settings, Confirmation } screen_ = Screen::MainBar;
+    int achievementSelection_ = 0;
+    enum class AchievementFilter { All, Locked, Unlocked } achievementFilter_ = AchievementFilter::All;
+    bool revealHiddenAchievements_ = false;
+    LONG achievementGeneration_ = -1;
     int settingsSelection_ = 0;
     int confirmationSelection_ = 0;
     IAudioEndpointVolume* endpointVolume_ = nullptr;
@@ -75,7 +90,9 @@ private:
     HBITMAP frameBitmap_ = nullptr;
     void* framePixels_ = nullptr;
     int frameWidth_ = 0;
+    int frameHeight_ = 480;
     std::vector<std::uint32_t> blurredBackground_;
     IconImage icons_[3];
+    IconImage buttonIcons_[3];
     static OverlayWindow* activeInstance_;
 };

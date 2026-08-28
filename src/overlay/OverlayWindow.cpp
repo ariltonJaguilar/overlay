@@ -15,18 +15,17 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"GameOverlayMvp.Window";
 constexpr int kOverlayWidth = 620;
 constexpr int kBarHeight = 280;
-constexpr int kOverlayHeight = 480;
-constexpr int kBarTop = kOverlayHeight - kBarHeight;
-constexpr BYTE kGradientBottomOpacity = 235;
+constexpr BYTE kGradientBottomOpacity = 245;
 constexpr BYTE kPanelRed = 24;
 constexpr BYTE kPanelGreen = 24;
 constexpr BYTE kPanelBlue = 28;
 constexpr int kVolumePanelWidth = 620;
-constexpr int kVolumePanelTop = 18;
-constexpr int kVolumePanelBottom = 194;
 constexpr int kVolumePanelRadius = 28;
 constexpr int kSliderHalfWidth = 210;
-constexpr int kSliderY = 112;
+constexpr int kAchievementPanelWidth = 760;
+constexpr int kAchievementListTop = 92;
+constexpr int kAchievementRowHeight = 150;
+constexpr int kAchievementCardHeight = 142;
 
 struct WindowSearch {
     DWORD pid;
@@ -141,6 +140,16 @@ float roundedRectangleCoverage(int x, int y, int left, int top, int right, int b
     return std::clamp(radius + 0.5f - distance, 0.0f, 1.0f);
 }
 
+std::wstring fromUtf8(const char* text) {
+    if (!text || !*text) return {};
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (length <= 1) return {};
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, result.data(), length);
+    result.resize(static_cast<size_t>(length - 1));
+    return result;
+}
+
 void fillRoundedRectangleCorners(HDC dc, const RECT& rect,
                                  int topLeft, int topRight, int bottomRight, int bottomLeft) {
     constexpr double kappa = 0.5522847498;
@@ -174,6 +183,42 @@ void fillRoundedRectangleCorners(HDC dc, const RECT& rect,
 
 OverlayWindow* OverlayWindow::activeInstance_ = nullptr;
 
+int OverlayWindow::barTop() const { return frameHeight_ - kBarHeight; }
+int OverlayWindow::menuOffset() const { return barTop() - 200; }
+int OverlayWindow::sliderY() const { return menuOffset() + 112; }
+int OverlayWindow::achievementVisibleCount() const {
+    return (std::max)(1, (barTop() - 70 - kAchievementListTop) / kAchievementRowHeight);
+}
+std::vector<int> OverlayWindow::filteredAchievementIndices() const {
+    std::vector<int> result;
+    if (!achievementState_ || achievementState_->status != 1) return result;
+    const int count = achievementState_->count;
+    result.reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        const bool unlocked = achievementState_->achievements[index].unlocked != FALSE;
+        if (achievementFilter_ == AchievementFilter::All ||
+            (achievementFilter_ == AchievementFilter::Locked && !unlocked) ||
+            (achievementFilter_ == AchievementFilter::Unlocked && unlocked)) {
+            result.push_back(index);
+        }
+    }
+    return result;
+}
+void OverlayWindow::cycleAchievementFilter() {
+    if (screen_ != Screen::Achievements) return;
+    achievementFilter_ = achievementFilter_ == AchievementFilter::All
+        ? AchievementFilter::Locked
+        : achievementFilter_ == AchievementFilter::Locked
+            ? AchievementFilter::Unlocked : AchievementFilter::All;
+    achievementSelection_ = 0;
+    renderAndPresent();
+}
+void OverlayWindow::toggleHiddenAchievementDetails() {
+    if (screen_ != Screen::Achievements) return;
+    revealHiddenAchievements_ = !revealHiddenAchievements_;
+    renderAndPresent();
+}
+
 bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
     gamePid_ = gamePid;
     gameProcess_ = OpenProcess(SYNCHRONIZE, FALSE, gamePid);
@@ -193,6 +238,19 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
     InterlockedExchange(&sharedState_->controllerThumbLX, 0);
     InterlockedExchange(&sharedState_->controllerThumbLY, 0);
     InterlockedExchange(&sharedState_->toggleOverlayRequest, FALSE);
+    InterlockedExchange(&sharedState_->controllerUpdateTick, 0);
+
+    const std::wstring achievementName = achievementSharedMemoryName(gamePid);
+    achievementMapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                              sizeof(AchievementSharedState), achievementName.c_str());
+    if (achievementMapping_) {
+        achievementState_ = static_cast<AchievementSharedState*>(MapViewOfFile(
+            achievementMapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(AchievementSharedState)));
+        if (achievementState_) {
+            ZeroMemory(achievementState_, sizeof(*achievementState_));
+            achievementState_->version = kAchievementSharedVersion;
+        }
+    }
     loadIcons();
     GameInputCreate(&gameInput_);
 
@@ -207,7 +265,7 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
 
     const DWORD extendedStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     window_ = CreateWindowExW(extendedStyle, kWindowClass, L"Game Overlay MVP", WS_POPUP,
-                              0, 0, kOverlayWidth, kOverlayHeight, nullptr, nullptr, instance, this);
+                              0, 0, kOverlayWidth, frameHeight_, nullptr, nullptr, instance, this);
     if (!window_) return false;
 
     activeInstance_ = this;
@@ -238,7 +296,7 @@ void OverlayWindow::applyVisualStyle() {
     systemBackdrop_ = false;
 }
 
-void OverlayWindow::centerOnGameMonitor() const {
+void OverlayWindow::centerOnGameMonitor() {
     WindowSearch search{gamePid_, nullptr};
     EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&search));
     HMONITOR monitor = search.result ? MonitorFromWindow(search.result, MONITOR_DEFAULTTONEAREST)
@@ -247,8 +305,10 @@ void OverlayWindow::centerOnGameMonitor() const {
     info.cbSize = sizeof(info);
     GetMonitorInfoW(monitor, &info);
     const int width = info.rcMonitor.right - info.rcMonitor.left;
-    const int y = info.rcMonitor.bottom - kOverlayHeight;
-    SetWindowPos(window_, HWND_TOPMOST, info.rcMonitor.left, y, width, kOverlayHeight, SWP_NOACTIVATE);
+    const int monitorHeight = info.rcMonitor.bottom - info.rcMonitor.top;
+    frameHeight_ = (std::max)(480, monitorHeight - 56);
+    const int y = info.rcMonitor.bottom - frameHeight_;
+    SetWindowPos(window_, HWND_TOPMOST, info.rcMonitor.left, y, width, frameHeight_, SWP_NOACTIVATE);
 }
 
 void OverlayWindow::toggleVisibility() {
@@ -332,6 +392,7 @@ LRESULT CALLBACK OverlayWindow::keyboardHookProc(int code, WPARAM wParam, LPARAM
                 } else if (key->vkCode == VK_LEFT || key->vkCode == VK_RIGHT ||
                            key->vkCode == VK_UP || key->vkCode == VK_DOWN ||
                            key->vkCode == VK_RETURN || key->vkCode == VK_SPACE ||
+                           key->vkCode == 'X' || key->vkCode == 'Y' ||
                            key->vkCode == VK_ESCAPE) {
                     PostMessageW(activeInstance_->window_, WM_KEYDOWN, key->vkCode, 0);
                 }
@@ -352,6 +413,12 @@ void OverlayWindow::moveSelection(int direction) {
         renderAndPresent();
         return;
     }
+    if (screen_ == Screen::Achievements) {
+        const int count = static_cast<int>(filteredAchievementIndices().size());
+        if (count > 0) achievementSelection_ = std::clamp(achievementSelection_ + direction, 0, count - 1);
+        renderAndPresent();
+        return;
+    }
     if (screen_ == Screen::Confirmation) {
         confirmationSelection_ = (confirmationSelection_ + direction + 2) % 2;
         renderAndPresent();
@@ -362,6 +429,14 @@ void OverlayWindow::moveSelection(int direction) {
 }
 
 void OverlayWindow::activateSelection() {
+    if (screen_ == Screen::MainBar && selectedItem_ == 0) {
+        achievementSelection_ = 0;
+        achievementFilter_ = AchievementFilter::All;
+        revealHiddenAchievements_ = false;
+        screen_ = Screen::Achievements;
+        renderAndPresent();
+        return;
+    }
     if (screen_ == Screen::MainBar && selectedItem_ == 1) {
         // O dispositivo padrao pode mudar enquanto o overlay esta executando
         // (headset, HDMI, Bluetooth). Reabra o endpoint ao entrar nesta tela.
@@ -400,7 +475,8 @@ void OverlayWindow::goBack() {
     if (screen_ == Screen::Confirmation) {
         screen_ = Screen::Settings;
         renderAndPresent();
-    } else if (screen_ == Screen::Volume || screen_ == Screen::Settings) {
+    } else if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
+               screen_ == Screen::Settings) {
         draggingVolume_ = false;
         screen_ = Screen::MainBar;
         renderAndPresent();
@@ -476,6 +552,13 @@ void OverlayWindow::pollController() {
         InterlockedExchange(&sharedState_->toggleOverlayRequest, FALSE) != FALSE) {
         toggleVisibility();
     }
+    if (achievementState_ && screen_ == Screen::Achievements) {
+        const LONG generation = InterlockedCompareExchange(&achievementState_->generation, 0, 0);
+        if (generation != achievementGeneration_) {
+            achievementGeneration_ = generation;
+            renderAndPresent();
+        }
+    }
     if (!shown_) {
         ZeroMemory(previousControllerButtons_, sizeof(previousControllerButtons_));
         previousGameInputButtons_ = GameInputGamepadNone;
@@ -502,7 +585,9 @@ void OverlayWindow::pollController() {
     // Fonte preferencial: estado capturado dentro do próprio processo do jogo.
     // Isso também funciona quando a Steam expõe o controle apenas ao jogo.
     if (sharedState_ &&
-        InterlockedCompareExchange(&sharedState_->controllerConnected, 0, 0) != FALSE) {
+        InterlockedCompareExchange(&sharedState_->controllerConnected, 0, 0) != FALSE &&
+        static_cast<DWORD>(GetTickCount() - static_cast<DWORD>(
+            InterlockedCompareExchange(&sharedState_->controllerUpdateTick, 0, 0))) < 250) {
         const WORD buttons = static_cast<WORD>(
             InterlockedCompareExchange(&sharedState_->controllerButtons, 0, 0));
         const SHORT thumbLX = static_cast<SHORT>(
@@ -511,7 +596,7 @@ void OverlayWindow::pollController() {
             InterlockedCompareExchange(&sharedState_->controllerThumbLY, 0, 0));
         const WORD pressed = static_cast<WORD>(buttons & ~previousSharedControllerButtons_);
         int direction = 0;
-        if (screen_ == Screen::Settings) {
+        if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || thumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || thumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -522,6 +607,8 @@ void OverlayWindow::pollController() {
         }
         navigate(direction);
         if (pressed & XINPUT_GAMEPAD_A) activateSelection();
+        if (pressed & XINPUT_GAMEPAD_Y) cycleAchievementFilter();
+        if (pressed & XINPUT_GAMEPAD_X) toggleHiddenAchievementDetails();
         if (pressed & XINPUT_GAMEPAD_B) goBack();
         previousSharedControllerButtons_ = buttons;
         return;
@@ -537,7 +624,7 @@ void OverlayWindow::pollController() {
                     static_cast<unsigned int>(buttons) &
                     ~static_cast<unsigned int>(previousGameInputButtons_));
                 int direction = 0;
-                if (screen_ == Screen::Settings) {
+                if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
                     if ((buttons & GameInputGamepadDPadUp) || state.leftThumbstickY > 0.35f) direction = -1;
                     else if ((buttons & GameInputGamepadDPadDown) || state.leftThumbstickY < -0.35f) direction = 1;
                 } else {
@@ -548,6 +635,8 @@ void OverlayWindow::pollController() {
                 }
                 navigate(direction);
                 if (pressed & GameInputGamepadA) activateSelection();
+                if (pressed & GameInputGamepadY) cycleAchievementFilter();
+                if (pressed & GameInputGamepadX) toggleHiddenAchievementDetails();
                 if (pressed & GameInputGamepadB) goBack();
                 previousGameInputButtons_ = buttons;
                 reading->Release();
@@ -567,7 +656,7 @@ void OverlayWindow::pollController() {
         const WORD buttons = state.Gamepad.wButtons;
         const WORD pressed = static_cast<WORD>(buttons & ~previousControllerButtons_[userIndex]);
         int direction = 0;
-        if (screen_ == Screen::Settings) {
+        if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -580,6 +669,8 @@ void OverlayWindow::pollController() {
         navigate(direction);
 
         if (pressed & XINPUT_GAMEPAD_A) activateSelection();
+        if (pressed & XINPUT_GAMEPAD_Y) cycleAchievementFilter();
+        if (pressed & XINPUT_GAMEPAD_X) toggleHiddenAchievementDetails();
         if (pressed & XINPUT_GAMEPAD_B) goBack();
         previousControllerButtons_[userIndex] = buttons;
         return; // O primeiro controle conectado assume a navegação da barra.
@@ -594,8 +685,31 @@ void OverlayWindow::draw(HDC dc) const {
     GetClientRect(window_, &client);
     const int width = client.right - client.left;
     SetBkMode(dc, TRANSPARENT);
+    if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
+        screen_ == Screen::Settings) {
+        HFONT titleFont = CreateFontW(44, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                      ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldTitleFont = SelectObject(dc, titleFont);
+        SetTextColor(dc, RGB(248, 249, 252));
+        RECT titleRect{};
+        const wchar_t* title = nullptr;
+        if (screen_ == Screen::Volume) {
+            title = L"Volume";
+            titleRect = RECT{0, sliderY() - 76, width, sliderY() - 30};
+        } else if (screen_ == Screen::Achievements) {
+            title = L"Conquistas";
+            titleRect = RECT{0, 27, width, 76};
+        } else {
+            title = L"Configura\u00e7\u00f5" L"es";
+            titleRect = RECT{0, menuOffset() - 23, width, menuOffset() + 22};
+        }
+        DrawTextW(dc, title, -1, &titleRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, oldTitleFont);
+        DeleteObject(titleFont);
+    }
     if (screen_ == Screen::Settings || screen_ == Screen::Confirmation) {
-        HFONT font = CreateFontW(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        HFONT font = CreateFontW(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                  ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         HGDIOBJ oldFont = SelectObject(dc, font);
@@ -606,11 +720,12 @@ void OverlayWindow::draw(HDC dc) const {
         if (screen_ == Screen::Settings) {
             const wchar_t* labels[] = {L"Suspender", L"Desligar", L"Fechar jogo"};
             for (int index = 0; index < 3; ++index) {
-                RECT row{width / 2 - 245, 31 + index * 50, width / 2 + 245, 73 + index * 50};
+                RECT row{width / 2 - 245, menuOffset() + 31 + index * 50,
+                         width / 2 + 245, menuOffset() + 73 + index * 50};
                 if (index == settingsSelection_) {
                     HBRUSH selected = CreateSolidBrush(RGB(92, 95, 104));
                     SelectObject(dc, selected);
-                    if (index == 0) fillRoundedRectangleCorners(dc, row, 23, 23, 7, 7);
+                    if (index == 0) fillRoundedRectangleCorners(dc, row, 7, 7, 7, 7);
                     else if (index == 2) fillRoundedRectangleCorners(dc, row, 7, 7, 23, 23);
                     else fillRoundedRectangleCorners(dc, row, 7, 7, 7, 7);
                     SelectObject(dc, oldBrush);
@@ -621,13 +736,14 @@ void OverlayWindow::draw(HDC dc) const {
         } else {
             const wchar_t* actions[] = {L"Suspender o computador?", L"Desligar o computador?",
                                         L"Fechar o jogo?"};
-            RECT question{width / 2 - 205, 39, width / 2 + 205, 91};
+            RECT question{width / 2 - 205, menuOffset() + 39,
+                          width / 2 + 205, menuOffset() + 91};
             DrawTextW(dc, actions[settingsSelection_], -1, &question,
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             const wchar_t* labels[] = {L"Cancelar", L"Confirmar"};
             for (int index = 0; index < 2; ++index) {
-                RECT button{width / 2 - 210 + index * 220, 108,
-                            width / 2 - 10 + index * 220, 154};
+                RECT button{width / 2 - 210 + index * 220, menuOffset() + 108,
+                            width / 2 - 10 + index * 220, menuOffset() + 154};
                 COLORREF buttonColor{};
                 if (index == 1) {
                     buttonColor = index == confirmationSelection_ ? RGB(145, 91, 94)
@@ -648,14 +764,119 @@ void OverlayWindow::draw(HDC dc) const {
         SelectObject(dc, oldBrush); SelectObject(dc, oldPen); SelectObject(dc, oldFont);
         DeleteObject(font);
     }
+    if (screen_ == Screen::Achievements) {
+        const LONG status = achievementState_
+            ? InterlockedCompareExchange(&achievementState_->status, 0, 0) : -1;
+        const auto filtered = filteredAchievementIndices();
+        const int count = static_cast<int>(filtered.size());
+        HFONT nameFont = CreateFontW(30, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HFONT descriptionFont = CreateFontW(25, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                            ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, nameFont);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        if (status != 1 || count == 0) {
+            SetTextColor(dc, RGB(220, 222, 228));
+            RECT message{0, 220, width, 360};
+            const wchar_t* text = status < 0 ? L"Conquistas da Steam indisponiveis" :
+                                  status == 0 ? L"Carregando conquistas da Steam..." :
+                                                L"Nenhuma conquista neste filtro";
+            DrawTextW(dc, text, -1, &message, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        } else {
+            const int visibleCount = achievementVisibleCount();
+            const int first = std::clamp(achievementSelection_ - visibleCount / 2, 0,
+                                         (std::max)(0, count - visibleCount));
+            for (int visible = 0; visible < visibleCount && first + visible < count; ++visible) {
+                const int position = first + visible;
+                const auto& achievement = achievementState_->achievements[filtered[position]];
+                RECT row{width / 2 - 370, kAchievementListTop + visible * kAchievementRowHeight,
+                         width / 2 + 370, kAchievementListTop + kAchievementCardHeight +
+                             visible * kAchievementRowHeight};
+                SetTextColor(dc, achievement.unlocked ? RGB(250, 250, 252) : RGB(145, 147, 154));
+                if (achievement.iconWidth <= 0) {
+                    RECT marker{row.left + 18, row.top, row.left + 92, row.bottom};
+                    DrawTextW(dc, achievement.unlocked ? L"\x2713" : L"\x25CB", -1, &marker,
+                              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                }
+                const bool conceal = achievement.hidden && !achievement.unlocked &&
+                                     !revealHiddenAchievements_;
+                std::wstring name = conceal ? L"Conquista oculta"
+                                            : fromUtf8(achievement.displayName);
+                std::wstring description = conceal
+                    ? L"Os detalhes desta conquista est\u00e3o ocultos"
+                    : fromUtf8(achievement.description);
+                RECT nameRect{row.left + 105, row.top + 10, row.right - 18, row.top + 72};
+                SelectObject(dc, nameFont);
+                DrawTextW(dc, name.c_str(), -1, &nameRect,
+                          DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                SetTextColor(dc, achievement.unlocked ? RGB(195, 197, 204) : RGB(115, 117, 124));
+                RECT descRect{row.left + 105, row.top + 74, row.right - 18,
+                              row.bottom - (achievement.hasProgress ? 23 : 10)};
+                SelectObject(dc, descriptionFont);
+                DrawTextW(dc, description.c_str(), -1, &descRect,
+                          DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                if (achievement.hasProgress && achievement.progressMaximum > 0) {
+                    const int progressLeft = row.left + 105;
+                    const int progressRight = row.right - 18;
+                    const int progressTop = row.bottom - 15;
+                    HBRUSH track = CreateSolidBrush(RGB(82, 84, 91));
+                    SelectObject(dc, track);
+                    RoundRect(dc, progressLeft, progressTop, progressRight, progressTop + 7, 7, 7);
+                    const double ratio = std::clamp(
+                        static_cast<double>(achievement.progressCurrent) /
+                            achievement.progressMaximum, 0.0, 1.0);
+                    const int activeRight = progressLeft +
+                        static_cast<int>((progressRight - progressLeft) * ratio);
+                    if (activeRight > progressLeft) {
+                        HBRUSH active = CreateSolidBrush(RGB(195, 197, 203));
+                        SelectObject(dc, active);
+                        RoundRect(dc, progressLeft, progressTop, activeRight, progressTop + 7, 7, 7);
+                        SelectObject(dc, track);
+                        DeleteObject(active);
+                    }
+                    SelectObject(dc, oldBrush);
+                    DeleteObject(track);
+                }
+            }
+        }
+        HFONT legendFont = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        SelectObject(dc, legendFont);
+        SetTextColor(dc, RGB(190, 192, 200));
+        const wchar_t* filterName = achievementFilter_ == AchievementFilter::All ? L"Todas" :
+                                    achievementFilter_ == AchievementFilter::Locked ? L"Bloqueadas" :
+                                                                                      L"Desbloqueadas";
+        const wchar_t* hiddenAction = revealHiddenAchievements_ ? L"Ocultar secretas"
+                                                                 : L"Revelar secretas";
+        const int center = width / 2;
+        const std::wstring hiddenText = (buttonIcons_[0].pixels.empty() ? L"X  " : L"") +
+                                        std::wstring(hiddenAction);
+        const std::wstring filterText = (buttonIcons_[1].pixels.empty() ? L"Y  " : L"") +
+                                        std::wstring(L"Filtrar: ") + filterName;
+        RECT hiddenRect{center - 320, barTop() - 58, center - 105, barTop() - 10};
+        RECT filterRect{center - 55, barTop() - 58, center + 180, barTop() - 10};
+        RECT backRect{center + 215, barTop() - 58, center + 360, barTop() - 10};
+        DrawTextW(dc, hiddenText.c_str(), -1, &hiddenRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(dc, filterText.c_str(), -1, &filterRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        const wchar_t* backText = buttonIcons_[2].pixels.empty() ? L"B  Voltar" : L"Voltar";
+        DrawTextW(dc, backText, -1, &backRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, oldFont);
+        DeleteObject(legendFont);
+        SelectObject(dc, oldBrush); SelectObject(dc, oldPen); SelectObject(dc, oldFont);
+        DeleteObject(descriptionFont); DeleteObject(nameFont);
+    }
     const int centers[] = {width / 2 - 190, width / 2, width / 2 + 190};
 
     for (int i = 0; i < 3; ++i) {
         const COLORREF color = RGB(245, 246, 250);
         if (icons_[i].pixels.empty()) {
-            if (i == 0) drawAchievementIcon(dc, centers[i], kBarTop + 190, color);
-            if (i == 1) drawVolumeIcon(dc, centers[i], kBarTop + 190, color);
-            if (i == 2) drawSettingsIcon(dc, centers[i], kBarTop + 190, color);
+            if (i == 0) drawAchievementIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 1) drawVolumeIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 2) drawSettingsIcon(dc, centers[i], barTop() + 190, color);
         }
     }
 }
@@ -665,19 +886,22 @@ bool OverlayWindow::loadIcons() {
     const DWORD length = GetModuleFileNameW(nullptr, executablePath,
                                             static_cast<DWORD>(std::size(executablePath)));
     const auto directory = std::filesystem::path(std::wstring(executablePath, length)).parent_path();
-    const wchar_t* filenames[] = {L"trophy.png", L"volume.png", L"settings.png"};
+    const wchar_t* filenames[] = {
+        L"trophy.png", L"volume.png", L"settings.png", L"x.png", L"y.png", L"b.png"
+    };
     bool allLoaded = true;
 
     IWICImagingFactory* factory = nullptr;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&factory)))) return false;
 
-    for (int index = 0; index < 3; ++index) {
+    for (int index = 0; index < 6; ++index) {
+        IconImage& destination = index < 3 ? icons_[index] : buttonIcons_[index - 3];
         IWICBitmapDecoder* decoder = nullptr;
         IWICBitmapFrameDecode* frame = nullptr;
         IWICBitmapScaler* scaler = nullptr;
         IWICFormatConverter* converter = nullptr;
-        const auto path = directory / L"assets" / L"icons" / filenames[index];
+        const auto path = directory / L"assets" / (index < 3 ? L"icons" : L"buttons") / filenames[index];
         HRESULT result = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
                                                              WICDecodeMetadataCacheOnLoad, &decoder);
         if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
@@ -685,7 +909,8 @@ bool OverlayWindow::loadIcons() {
         if (SUCCEEDED(result)) result = frame->GetSize(&sourceWidth, &sourceHeight);
         UINT width = 1, height = 1;
         if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
-            const double scale = (std::min)(60.0 / sourceWidth, 60.0 / sourceHeight);
+            const double maximumSize = index < 3 ? 60.0 : 30.0;
+            const double scale = (std::min)(maximumSize / sourceWidth, maximumSize / sourceHeight);
             width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
             height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
         }
@@ -697,15 +922,15 @@ bool OverlayWindow::loadIcons() {
             scaler, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
             WICBitmapPaletteTypeCustom);
         if (SUCCEEDED(result)) {
-            icons_[index].width = static_cast<int>(width);
-            icons_[index].height = static_cast<int>(height);
-            icons_[index].pixels.resize(static_cast<size_t>(width) * height);
+            destination.width = static_cast<int>(width);
+            destination.height = static_cast<int>(height);
+            destination.pixels.resize(static_cast<size_t>(width) * height);
             result = converter->CopyPixels(nullptr, width * 4,
-                                           static_cast<UINT>(icons_[index].pixels.size() * 4),
-                                           reinterpret_cast<BYTE*>(icons_[index].pixels.data()));
+                                           static_cast<UINT>(destination.pixels.size() * 4),
+                                           reinterpret_cast<BYTE*>(destination.pixels.data()));
         }
         if (FAILED(result)) {
-            icons_[index] = {};
+            destination = {};
             allLoaded = false;
         }
         if (converter) converter->Release();
@@ -723,7 +948,7 @@ void OverlayWindow::blendIcon(std::uint32_t* destination, int destinationWidth,
     const int left = centerX - icon.width / 2;
     const int top = centerY - icon.height / 2;
     for (int y = 0; y < icon.height; ++y) {
-        if (top + y < 0 || top + y >= kOverlayHeight) continue;
+        if (top + y < 0 || top + y >= frameHeight_) continue;
         for (int x = 0; x < icon.width; ++x) {
             if (left + x < 0 || left + x >= destinationWidth) continue;
             const auto source = icon.pixels[static_cast<size_t>(y) * icon.width + x];
@@ -753,7 +978,7 @@ void OverlayWindow::drawVolumeSlider(std::uint32_t* destination, int destination
     const float knobX = left + (right - left) * volumeLevel_;
 
     auto blendPixel = [&](int x, int y, BYTE gray, float coverage, BYTE opacity = 255) {
-        if (x < 0 || x >= destinationWidth || y < 0 || y >= kOverlayHeight) return;
+        if (x < 0 || x >= destinationWidth || y < 0 || y >= frameHeight_) return;
         const BYTE sourceAlpha = static_cast<BYTE>(std::clamp(coverage, 0.0f, 1.0f) * opacity);
         if (!sourceAlpha) return;
         const BYTE inverse = static_cast<BYTE>(255 - sourceAlpha);
@@ -770,13 +995,13 @@ void OverlayWindow::drawVolumeSlider(std::uint32_t* destination, int destination
     auto capsule = [&](float from, float to, float radius, BYTE gray) {
         const int minX = static_cast<int>(std::floor(from - radius - 1));
         const int maxX = static_cast<int>(std::ceil(to + radius + 1));
-        const int minY = static_cast<int>(std::floor(kSliderY - radius - 1));
-        const int maxY = static_cast<int>(std::ceil(kSliderY + radius + 1));
+        const int minY = static_cast<int>(std::floor(sliderY() - radius - 1));
+        const int maxY = static_cast<int>(std::ceil(sliderY() + radius + 1));
         for (int y = minY; y <= maxY; ++y) {
             for (int x = minX; x <= maxX; ++x) {
                 const float nearestX = std::clamp(x + 0.5f, from, to);
                 const float dx = x + 0.5f - nearestX;
-                const float dy = y + 0.5f - kSliderY;
+                const float dy = y + 0.5f - sliderY();
                 const float coverage = std::clamp(radius + 0.5f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);
                 blendPixel(x, y, gray, coverage);
             }
@@ -786,12 +1011,12 @@ void OverlayWindow::drawVolumeSlider(std::uint32_t* destination, int destination
     auto circle = [&](float radius, BYTE gray, BYTE opacity) {
         const int minX = static_cast<int>(std::floor(knobX - radius - 1));
         const int maxX = static_cast<int>(std::ceil(knobX + radius + 1));
-        const int minY = static_cast<int>(std::floor(kSliderY - radius - 1));
-        const int maxY = static_cast<int>(std::ceil(kSliderY + radius + 1));
+        const int minY = static_cast<int>(std::floor(sliderY() - radius - 1));
+        const int maxY = static_cast<int>(std::ceil(sliderY() + radius + 1));
         for (int y = minY; y <= maxY; ++y) {
             for (int x = minX; x <= maxX; ++x) {
                 const float dx = x + 0.5f - knobX;
-                const float dy = y + 0.5f - kSliderY;
+                const float dy = y + 0.5f - sliderY();
                 const float coverage = std::clamp(radius + 0.5f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);
                 blendPixel(x, y, gray, coverage, opacity);
             }
@@ -803,6 +1028,52 @@ void OverlayWindow::drawVolumeSlider(std::uint32_t* destination, int destination
     circle(17.0f, 35, 105);
     circle(13.0f, 238, 255);
     circle(8.0f, 205, 255);
+}
+
+void OverlayWindow::drawAchievementImages(std::uint32_t* destination, int destinationWidth) const {
+    if (!achievementState_ || achievementState_->status != 1) return;
+    const auto filtered = filteredAchievementIndices();
+    const int count = static_cast<int>(filtered.size());
+    const int visibleCount = achievementVisibleCount();
+    const int first = std::clamp(achievementSelection_ - visibleCount / 2, 0,
+                                 (std::max)(0, count - visibleCount));
+    for (int visible = 0; visible < visibleCount && first + visible < count; ++visible) {
+        const auto& achievement = achievementState_->achievements[filtered[first + visible]];
+        if (achievement.iconWidth != 64 || achievement.iconHeight != 64) continue;
+        const int left = destinationWidth / 2 - 352;
+        const int top = kAchievementListTop + 39 + visible * kAchievementRowHeight;
+        // A Steam ja devolve a variante correta (conquistada ou bloqueada).
+        // Nao altere cor, brilho ou opacidade da imagem recebida.
+        constexpr BYTE opacity = 255;
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                const auto source = achievement.iconPixels[y * 64 + x];
+                const float cornerX = (std::min)(x + 0.5f, 64.0f - (x + 0.5f));
+                const float cornerY = (std::min)(y + 0.5f, 64.0f - (y + 0.5f));
+                float mask = 1.0f;
+                if (cornerX < 8.0f && cornerY < 8.0f) {
+                    const float dx = 8.0f - cornerX;
+                    const float dy = 8.0f - cornerY;
+                    mask = std::clamp(8.5f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);
+                }
+                const float effectiveOpacity = opacity * mask;
+                const BYTE sourceAlpha = static_cast<BYTE>((source >> 24) * effectiveOpacity / 255);
+                if (!sourceAlpha) continue;
+                const BYTE inverse = static_cast<BYTE>(255 - sourceAlpha);
+                auto& target = destination[static_cast<size_t>(top + y) * destinationWidth + left + x];
+                const BYTE blue = static_cast<BYTE>((source & 0xff) * effectiveOpacity / 255 +
+                                                     (target & 0xff) * inverse / 255);
+                const BYTE green = static_cast<BYTE>(((source >> 8) & 0xff) * effectiveOpacity / 255 +
+                                                      ((target >> 8) & 0xff) * inverse / 255);
+                const BYTE red = static_cast<BYTE>(((source >> 16) & 0xff) * effectiveOpacity / 255 +
+                                                    ((target >> 16) & 0xff) * inverse / 255);
+                const BYTE alpha = static_cast<BYTE>(sourceAlpha + ((target >> 24) & 0xff) * inverse / 255);
+                target = (static_cast<std::uint32_t>(alpha) << 24) |
+                         (static_cast<std::uint32_t>(red) << 16) |
+                         (static_cast<std::uint32_t>(green) << 8) | blue;
+            }
+        }
+    }
 }
 
 void OverlayWindow::releaseRenderer() {
@@ -828,7 +1099,7 @@ bool OverlayWindow::captureAndBlurBackground() {
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -kOverlayHeight;
+    info.bmiHeader.biHeight = -frameHeight_;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
@@ -842,17 +1113,17 @@ bool OverlayWindow::captureAndBlurBackground() {
         return false;
     }
     SelectObject(frameDc_, frameBitmap_);
-    BitBlt(frameDc_, 0, 0, width, kOverlayHeight, screen, windowRect.left, windowRect.top,
+    BitBlt(frameDc_, 0, 0, width, frameHeight_, screen, windowRect.left, windowRect.top,
            SRCCOPY | CAPTUREBLT);
     ReleaseDC(nullptr, screen);
 
     frameWidth_ = width;
     const auto* captured = static_cast<const std::uint32_t*>(framePixels_);
-    blurredBackground_.assign(captured, captured + static_cast<size_t>(width) * kOverlayHeight);
+    blurredBackground_.assign(captured, captured + static_cast<size_t>(width) * frameHeight_);
     // Quatro passagens formam uma aproximação gaussiana mais forte e removem
     // artefatos de alta frequência da captura do jogo.
     for (int pass = 0; pass < 4; ++pass) {
-        boxBlur(blurredBackground_, width, kOverlayHeight, 18);
+        boxBlur(blurredBackground_, width, frameHeight_, 18);
     }
     return true;
 }
@@ -861,18 +1132,25 @@ void OverlayWindow::renderAndPresent() {
     if (!framePixels_ || blurredBackground_.empty() || frameWidth_ <= 0) return;
     auto* output = static_cast<std::uint32_t*>(framePixels_);
     if (screen_ == Screen::Volume) initializeSystemVolume();
-    const int panelWidth = screen_ == Screen::Settings ? 500 :
+    const int panelWidth = screen_ == Screen::Volume ? 464 :
+                           screen_ == Screen::Settings ? 500 :
+                           screen_ == Screen::Achievements ? kAchievementPanelWidth :
                            screen_ == Screen::Confirmation ? 430 : kVolumePanelWidth;
-    const int panelTop = screen_ == Screen::Settings ? 26 :
-                         screen_ == Screen::Confirmation ? 34 : kVolumePanelTop;
-    const int panelBottom = screen_ == Screen::Settings ? 178 :
-                            screen_ == Screen::Confirmation ? 159 : kVolumePanelBottom;
+    const int panelTop = screen_ == Screen::Volume ? sliderY() - 84 :
+                         screen_ == Screen::Achievements ? 18 :
+                         screen_ == Screen::Settings ? menuOffset() - 28 :
+                         screen_ == Screen::Confirmation ? menuOffset() + 34 : sliderY() - 22;
+    const int panelBottom = screen_ == Screen::Volume ? sliderY() + 22 :
+                            screen_ == Screen::Achievements ? barTop() - 6 :
+                            screen_ == Screen::Settings ? menuOffset() + 178 :
+                            screen_ == Screen::Confirmation ? menuOffset() + 159 : sliderY() + 22;
     const int panelLeft = (frameWidth_ - panelWidth) / 2;
     const int panelRight = panelLeft + panelWidth;
-    for (int y = 0; y < kOverlayHeight; ++y) {
-        const double progress = y >= kBarTop
-            ? static_cast<double>(y - kBarTop) / (kBarHeight - 1) : 0.0;
-        const double fadeProgress = y >= kBarTop ? (std::min)(1.0, progress * 2.0) : 0.0;
+    const int panelRadius = (std::min)(kVolumePanelRadius, (panelBottom - panelTop) / 2);
+    for (int y = 0; y < frameHeight_; ++y) {
+        const double progress = y >= barTop()
+            ? static_cast<double>(y - barTop()) / (kBarHeight - 1) : 0.0;
+        const double fadeProgress = y >= barTop() ? (std::min)(1.0, progress * 2.0) : 0.0;
         const double eased = fadeProgress * fadeProgress * (3.0 - 2.0 * fadeProgress);
         BYTE alpha = static_cast<BYTE>(kGradientBottomOpacity * eased);
         if (alpha < 6) alpha = 0; // Evita quantização cromática quase invisível no topo.
@@ -894,11 +1172,11 @@ void OverlayWindow::renderAndPresent() {
 
             if (screen_ != Screen::MainBar &&
                 roundedRectangleCoverage(x, y, panelLeft, panelTop, panelRight,
-                                         panelBottom, kVolumePanelRadius) > 0.0f) {
-                constexpr BYTE panelAlpha = 232;
-                constexpr double panelSourceWeight = 0.62;
+                                         panelBottom, panelRadius) > 0.0f) {
+                constexpr BYTE panelAlpha = 244;
+                constexpr double panelSourceWeight = 0.52;
                 const float coverage = roundedRectangleCoverage(
-                    x, y, panelLeft, panelTop, panelRight, panelBottom, kVolumePanelRadius);
+                    x, y, panelLeft, panelTop, panelRight, panelBottom, panelRadius);
                 const BYTE coveredAlpha = static_cast<BYTE>(panelAlpha * coverage);
                 const BYTE panelBlue = static_cast<BYTE>(((source & 0xff) * panelSourceWeight +
                     kPanelBlue * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
@@ -913,11 +1191,38 @@ void OverlayWindow::renderAndPresent() {
         }
     }
 
+    if (screen_ == Screen::Achievements && achievementState_ && achievementState_->status == 1 &&
+        !filteredAchievementIndices().empty()) {
+        const int count = static_cast<int>(filteredAchievementIndices().size());
+        const int visibleCount = achievementVisibleCount();
+        const int first = std::clamp(achievementSelection_ - visibleCount / 2, 0,
+                                     (std::max)(0, count - visibleCount));
+        const int visible = achievementSelection_ - first;
+        const int left = frameWidth_ / 2 - 370;
+        const int right = frameWidth_ / 2 + 370;
+        const int top = kAchievementListTop + visible * kAchievementRowHeight;
+        const int bottom = kAchievementListTop + kAchievementCardHeight +
+                           visible * kAchievementRowHeight;
+        for (int y = top; y < bottom; ++y) {
+            for (int x = left; x < right; ++x) {
+                const float coverage = roundedRectangleCoverage(x, y, left, top, right, bottom, 8);
+                if (coverage <= 0.0f) continue;
+                auto& pixel = output[static_cast<size_t>(y) * frameWidth_ + x];
+                const float multiplier = 1.0f - 0.30f * coverage;
+                const BYTE blue = static_cast<BYTE>((pixel & 0xff) * multiplier);
+                const BYTE green = static_cast<BYTE>(((pixel >> 8) & 0xff) * multiplier);
+                const BYTE red = static_cast<BYTE>(((pixel >> 16) & 0xff) * multiplier);
+                pixel = (pixel & 0xff000000u) | (static_cast<std::uint32_t>(red) << 16) |
+                        (static_cast<std::uint32_t>(green) << 8) | blue;
+            }
+        }
+    }
+
     BITMAPINFO uiInfo{};
     constexpr int uiScale = 3;
     uiInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     uiInfo.bmiHeader.biWidth = frameWidth_ * uiScale;
-    uiInfo.bmiHeader.biHeight = -kOverlayHeight * uiScale;
+    uiInfo.bmiHeader.biHeight = -frameHeight_ * uiScale;
     uiInfo.bmiHeader.biPlanes = 1;
     uiInfo.bmiHeader.biBitCount = 32;
     uiInfo.bmiHeader.biCompression = BI_RGB;
@@ -926,7 +1231,7 @@ void OverlayWindow::renderAndPresent() {
     HDC uiDc = CreateCompatibleDC(frameDc_);
     HGDIOBJ oldUiBitmap = SelectObject(uiDc, uiBitmap);
     ZeroMemory(uiPixelsRaw, static_cast<size_t>(frameWidth_ * uiScale) *
-                              (kOverlayHeight * uiScale) * sizeof(std::uint32_t));
+                              (frameHeight_ * uiScale) * sizeof(std::uint32_t));
     SetGraphicsMode(uiDc, GM_ADVANCED);
     XFORM transform{static_cast<FLOAT>(uiScale), 0.0f, 0.0f,
                     static_cast<FLOAT>(uiScale), 0.0f, 0.0f};
@@ -935,7 +1240,7 @@ void OverlayWindow::renderAndPresent() {
 
     const auto* uiPixels = static_cast<const std::uint32_t*>(uiPixelsRaw);
     const int uiWidth = frameWidth_ * uiScale;
-    for (int y = 0; y < kOverlayHeight; ++y) {
+    for (int y = 0; y < frameHeight_; ++y) {
       for (int x = 0; x < frameWidth_; ++x) {
         unsigned blueSum = 0, greenSum = 0, redSum = 0;
         for (int sampleY = 0; sampleY < uiScale; ++sampleY) {
@@ -968,10 +1273,16 @@ void OverlayWindow::renderAndPresent() {
     }
 
     if (screen_ == Screen::Volume) drawVolumeSlider(output, frameWidth_);
+    if (screen_ == Screen::Achievements) {
+        drawAchievementImages(output, frameWidth_);
+        blendIcon(output, frameWidth_, buttonIcons_[0], frameWidth_ / 2 - 345, barTop() - 34, 255);
+        blendIcon(output, frameWidth_, buttonIcons_[1], frameWidth_ / 2 - 80, barTop() - 34, 255);
+        blendIcon(output, frameWidth_, buttonIcons_[2], frameWidth_ / 2 + 195, barTop() - 34, 255);
+    }
 
     const int iconCenters[] = {frameWidth_ / 2 - 190, frameWidth_ / 2, frameWidth_ / 2 + 190};
     for (int index = 0; index < 3; ++index) {
-        blendIcon(output, frameWidth_, icons_[index], iconCenters[index], kBarTop + 190,
+        blendIcon(output, frameWidth_, icons_[index], iconCenters[index], barTop() + 190,
                   index == selectedItem_ ? 255 : 82);
     }
     SelectObject(uiDc, oldUiBitmap);
@@ -981,7 +1292,7 @@ void OverlayWindow::renderAndPresent() {
     RECT windowRect{};
     GetWindowRect(window_, &windowRect);
     POINT destination{windowRect.left, windowRect.top};
-    SIZE size{frameWidth_, kOverlayHeight};
+    SIZE size{frameWidth_, frameHeight_};
     POINT source{0, 0};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     HDC screen = GetDC(nullptr);
@@ -1002,18 +1313,25 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         if (!self) return HTCLIENT;
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(window, &point);
-        if (point.y >= kBarTop) return HTCLIENT;
+        if (point.y >= self->barTop()) return HTCLIENT;
         if (self->screen_ != Screen::MainBar) {
-            const int panelWidth = self->screen_ == Screen::Settings ? 500 :
+            const int panelWidth = self->screen_ == Screen::Volume ? 464 :
+                                   self->screen_ == Screen::Settings ? 500 :
+                                   self->screen_ == Screen::Achievements ? kAchievementPanelWidth :
                                    self->screen_ == Screen::Confirmation ? 430 : kVolumePanelWidth;
-            const int panelTop = self->screen_ == Screen::Settings ? 26 :
-                                 self->screen_ == Screen::Confirmation ? 34 : kVolumePanelTop;
-            const int panelBottom = self->screen_ == Screen::Settings ? 178 :
-                                    self->screen_ == Screen::Confirmation ? 159 : kVolumePanelBottom;
+            const int panelTop = self->screen_ == Screen::Volume ? self->sliderY() - 84 :
+                                 self->screen_ == Screen::Achievements ? 18 :
+                                 self->screen_ == Screen::Settings ? self->menuOffset() - 28 :
+                                 self->screen_ == Screen::Confirmation ? self->menuOffset() + 34 : self->sliderY() - 22;
+            const int panelBottom = self->screen_ == Screen::Volume ? self->sliderY() + 22 :
+                                    self->screen_ == Screen::Achievements ? self->barTop() - 6 :
+                                    self->screen_ == Screen::Settings ? self->menuOffset() + 178 :
+                                    self->screen_ == Screen::Confirmation ? self->menuOffset() + 159 : self->sliderY() + 22;
             const int left = (self->frameWidth_ - panelWidth) / 2;
+            const int radius = (std::min)(kVolumePanelRadius, (panelBottom - panelTop) / 2);
             if (insideRoundedRectangle(point.x, point.y, left, panelTop,
                                        left + panelWidth, panelBottom,
-                                       kVolumePanelRadius)) return HTCLIENT;
+                                       radius)) return HTCLIENT;
         }
         return HTTRANSPARENT;
     }
@@ -1036,8 +1354,12 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         if (!self) return 0;
         if (wParam == VK_LEFT) self->moveSelection(-1);
         else if (wParam == VK_RIGHT) self->moveSelection(1);
-        else if (wParam == VK_UP && self->screen_ == Screen::Settings) self->moveSelection(-1);
-        else if (wParam == VK_DOWN && self->screen_ == Screen::Settings) self->moveSelection(1);
+        else if (wParam == VK_UP && (self->screen_ == Screen::Settings ||
+                                     self->screen_ == Screen::Achievements)) self->moveSelection(-1);
+        else if (wParam == VK_DOWN && (self->screen_ == Screen::Settings ||
+                                       self->screen_ == Screen::Achievements)) self->moveSelection(1);
+        else if (wParam == 'Y') self->cycleAchievementFilter();
+        else if (wParam == 'X') self->toggleHiddenAchievementDetails();
         else if (wParam == VK_RETURN || wParam == VK_SPACE) self->activateSelection();
         else if (wParam == VK_ESCAPE) self->goBack();
         return 0;
@@ -1045,13 +1367,35 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         if (self && self->screen_ == Screen::Volume) {
             const int x = GET_X_LPARAM(lParam);
             const int y = GET_Y_LPARAM(lParam);
+            if (self->screen_ == Screen::Achievements) {
+                const int count = static_cast<int>(self->filteredAchievementIndices().size());
+                const int visibleCount = self->achievementVisibleCount();
+                if (count > 0 && y >= kAchievementListTop &&
+                    y < kAchievementListTop + visibleCount * kAchievementRowHeight) {
+                    const int first = std::clamp(
+                        self->achievementSelection_ - visibleCount / 2, 0,
+                        (std::max)(0, count - visibleCount));
+                    const int selected = first +
+                        (y - kAchievementListTop) / kAchievementRowHeight;
+                    if (selected < count) {
+                        self->achievementSelection_ = selected;
+                        self->renderAndPresent();
+                    }
+                }
+                return 0;
+            }
             const int center = self->frameWidth_ / 2;
-            if (y >= kSliderY - 22 && y <= kSliderY + 22 &&
+            if (y >= self->sliderY() - 22 && y <= self->sliderY() + 22 &&
                 x >= center - kSliderHalfWidth - 12 && x <= center + kSliderHalfWidth + 12) {
                 self->draggingVolume_ = true;
                 SetCapture(window);
                 self->setVolumeFromMouse(x);
             }
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (self && self->screen_ == Screen::Achievements) {
+            self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -1070,15 +1414,15 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             }
             const int y = GET_Y_LPARAM(lParam);
             if (self->screen_ == Screen::Settings) {
-                if (y >= 31 && y < 181) {
-                    self->settingsSelection_ = std::clamp((y - 31) / 50, 0, 2);
+                if (y >= self->menuOffset() + 31 && y < self->menuOffset() + 181) {
+                    self->settingsSelection_ = std::clamp((y - (self->menuOffset() + 31)) / 50, 0, 2);
                     self->renderAndPresent();
                     self->activateSelection();
                 }
                 return 0;
             }
             if (self->screen_ == Screen::Confirmation) {
-                if (y >= 108 && y <= 154) {
+                if (y >= self->menuOffset() + 108 && y <= self->menuOffset() + 154) {
                     const int center = self->frameWidth_ / 2;
                     if (x >= center - 210 && x <= center - 10) self->confirmationSelection_ = 0;
                     else if (x >= center + 10 && x <= center + 210) self->confirmationSelection_ = 1;
@@ -1088,7 +1432,7 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
                 }
                 return 0;
             }
-            if (y < kBarTop) return 0;
+            if (y < self->barTop()) return 0;
             RECT client{};
             GetClientRect(window, &client);
             const int center = client.right / 2;
@@ -1149,6 +1493,8 @@ int OverlayWindow::run(HINSTANCE instance, DWORD gamePid) {
     if (endpointVolume_) endpointVolume_->Release();
     if (gameInput_) gameInput_->Release();
     UnmapViewOfFile(sharedState_);
+    if (achievementState_) UnmapViewOfFile(achievementState_);
+    if (achievementMapping_) CloseHandle(achievementMapping_);
     CloseHandle(sharedMapping_);
     CloseHandle(gameProcess_);
     CloseHandle(mutex);

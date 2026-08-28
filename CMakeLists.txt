@@ -21,6 +21,7 @@ add_executable(Overlay WIN32
 add_library(OverlayInputHook SHARED
     src/input_hook/dllmain.cpp
     src/common/InputShared.h
+    src/common/AchievementShared.h
 )
 
 target_include_directories(Overlay PRIVATE src/common)
@@ -32,6 +33,9 @@ add_custom_command(TARGET Overlay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/assets/icons"
             "$<TARGET_FILE_DIR:Overlay>/assets/icons"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets/buttons"
+            "$<TARGET_FILE_DIR:Overlay>/assets/buttons"
 )
 
 target_compile_definitions(GameOverlayManager PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

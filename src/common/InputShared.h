@@ -4,7 +4,7 @@
 
 #include <string>
 
-constexpr LONG kInputSharedVersion = 4;
+constexpr LONG kInputSharedVersion = 5;
 
 struct InputSharedState {
     LONG version;
@@ -14,6 +14,7 @@ struct InputSharedState {
     volatile LONG controllerThumbLX;
     volatile LONG controllerThumbLY;
     volatile LONG toggleOverlayRequest;
+    volatile LONG controllerUpdateTick;
 };
 
 inline std::wstring inputSharedMemoryName(DWORD gamePid) {
