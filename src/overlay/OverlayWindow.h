@@ -47,6 +47,8 @@ private:
     void renderAndPresent();
     void releaseRenderer();
     bool loadIcons();
+    bool loadGameIcon();
+    bool loadSteamGameLogo(unsigned int appId);
     void blendIcon(std::uint32_t* destination, int destinationWidth,
                    const IconImage& icon, int centerX, int centerY, BYTE opacity) const;
     void drawVolumeSlider(std::uint32_t* destination, int destinationWidth) const;
@@ -97,5 +99,8 @@ private:
     std::vector<std::uint32_t> blurredBackground_;
     IconImage icons_[3];
     IconImage buttonIcons_[3];
+    IconImage gameIcon_;
+    unsigned int loadedGameLogoAppId_ = 0;
+    int displayedClockMinute_ = -1;
     static OverlayWindow* activeInstance_;
 };

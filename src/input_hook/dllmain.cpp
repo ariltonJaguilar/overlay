@@ -313,6 +313,7 @@ void collectSteamAchievements() {
         }
         void* steamUtils = getUtils ? getUtils() : nullptr;
         const unsigned int appId = steamUtils && getAppId ? getAppId(steamUtils) : 0;
+        InterlockedExchange(&shared->appId, static_cast<LONG>(appId));
         const auto schema = appId ? steamAchievementSchema(appId) : std::vector<unsigned char>{};
         auto reloadIcon = [&](SharedAchievement& target) {
             if (!steamUtils || !getIcon || !getImageSize || !getImageRgba) return false;

@@ -1,6 +1,7 @@
 #include "OverlayWindow.h"
 
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #include <wincodec.h>
 #include <mmdeviceapi.h>
@@ -16,7 +17,7 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"GameOverlayMvp.Window";
 constexpr int kOverlayWidth = 620;
 constexpr int kBarHeight = 280;
-constexpr BYTE kGradientBottomOpacity = 245;
+constexpr BYTE kGradientBottomOpacity = 250;
 constexpr BYTE kPanelRed = 24;
 constexpr BYTE kPanelGreen = 24;
 constexpr BYTE kPanelBlue = 28;
@@ -314,6 +315,7 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
         }
     }
     loadIcons();
+    loadGameIcon();
     GameInputCreate(&gameInput_);
 
     WNDCLASSEXW windowClass{};
@@ -974,6 +976,23 @@ void OverlayWindow::draw(HDC dc) const {
     }
     const int centers[] = {width / 2 - 190, width / 2, width / 2 + 190};
 
+    if (screen_ == Screen::MainBar) {
+        SYSTEMTIME localTime{};
+        GetLocalTime(&localTime);
+        wchar_t clockText[6]{};
+        swprintf_s(clockText, L"%02u:%02u", localTime.wHour, localTime.wMinute);
+        HFONT clockFont = CreateFontW(34, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                      ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldClockFont = SelectObject(dc, clockFont);
+        SetTextColor(dc, RGB(185, 187, 192));
+        RECT clockRect{width - 190, barTop() + 160, width - 42, barTop() + 220};
+        DrawTextW(dc, clockText, -1, &clockRect,
+                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, oldClockFont);
+        DeleteObject(clockFont);
+    }
+
     for (int i = 0; i < 3; ++i) {
         const COLORREF color = RGB(245, 246, 250);
         if (icons_[i].pixels.empty()) {
@@ -1043,6 +1062,140 @@ bool OverlayWindow::loadIcons() {
     }
     factory->Release();
     return allLoaded;
+}
+
+bool OverlayWindow::loadGameIcon() {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, gamePid_);
+    if (!process) return false;
+    wchar_t executablePath[32768]{};
+    DWORD length = static_cast<DWORD>(std::size(executablePath));
+    const BOOL queried = QueryFullProcessImageNameW(process, 0, executablePath, &length);
+    CloseHandle(process);
+    if (!queried) return false;
+
+    HICON largeIcon = nullptr;
+    if (ExtractIconExW(executablePath, 0, &largeIcon, nullptr, 1) == 0 || !largeIcon)
+        return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmap* source = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(result)) result = factory->CreateBitmapFromHICON(largeIcon, &source);
+    UINT sourceWidth = 0, sourceHeight = 0;
+    if (SUCCEEDED(result)) result = source->GetSize(&sourceWidth, &sourceHeight);
+    UINT width = 1, height = 1;
+    if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
+        constexpr double maximumSize = 64.0;
+        const double scale = (std::min)(maximumSize / sourceWidth, maximumSize / sourceHeight);
+        width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
+        height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
+    }
+    if (SUCCEEDED(result)) result = factory->CreateBitmapScaler(&scaler);
+    if (SUCCEEDED(result)) result = scaler->Initialize(source, width, height,
+                                                       WICBitmapInterpolationModeFant);
+    if (SUCCEEDED(result)) result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result)) result = converter->Initialize(
+        scaler, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+        WICBitmapPaletteTypeCustom);
+    if (SUCCEEDED(result)) {
+        gameIcon_.width = static_cast<int>(width);
+        gameIcon_.height = static_cast<int>(height);
+        gameIcon_.pixels.resize(static_cast<size_t>(width) * height);
+        result = converter->CopyPixels(nullptr, width * 4,
+                                       static_cast<UINT>(gameIcon_.pixels.size() * 4),
+                                       reinterpret_cast<BYTE*>(gameIcon_.pixels.data()));
+    }
+    if (FAILED(result)) gameIcon_ = {};
+    if (converter) converter->Release();
+    if (scaler) scaler->Release();
+    if (source) source->Release();
+    if (factory) factory->Release();
+    DestroyIcon(largeIcon);
+    return SUCCEEDED(result);
+}
+
+bool OverlayWindow::loadSteamGameLogo(unsigned int appId) {
+    if (!appId) return false;
+    wchar_t steamPath[32768]{};
+    DWORD pathBytes = sizeof(steamPath);
+    LSTATUS registryResult = RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam",
+                                          L"SteamPath", RRF_RT_REG_SZ, nullptr,
+                                          steamPath, &pathBytes);
+    if (registryResult != ERROR_SUCCESS) {
+        pathBytes = sizeof(steamPath);
+        registryResult = RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam",
+                                      L"InstallPath", RRF_RT_REG_SZ, nullptr,
+                                      steamPath, &pathBytes);
+    }
+    if (registryResult != ERROR_SUCCESS) return false;
+
+    const auto cache = std::filesystem::path(steamPath) / L"appcache" / L"librarycache";
+    const std::wstring appIdText = std::to_wstring(appId);
+    std::filesystem::path logoPath = cache / (appIdText + L"_logo.png");
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(logoPath, error)) {
+        logoPath.clear();
+        const auto appCache = cache / appIdText;
+        for (std::filesystem::directory_iterator item(appCache, error), end;
+             !error && item != end; item.increment(error)) {
+            if (!item->is_regular_file(error)) continue;
+            std::wstring filename = item->path().filename().wstring();
+            std::transform(filename.begin(), filename.end(), filename.begin(),
+                           [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+            if (filename.find(L"logo") != std::wstring::npos &&
+                item->path().extension() == L".png") {
+                logoPath = item->path();
+                break;
+            }
+        }
+    }
+    if (logoPath.empty()) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(result)) result = factory->CreateDecoderFromFilename(
+        logoPath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
+    UINT sourceWidth = 0, sourceHeight = 0;
+    if (SUCCEEDED(result)) result = frame->GetSize(&sourceWidth, &sourceHeight);
+    UINT width = 1, height = 1;
+    if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
+        const double scale = (std::min)(180.0 / sourceWidth, 72.0 / sourceHeight);
+        width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
+        height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
+    }
+    if (SUCCEEDED(result)) result = factory->CreateBitmapScaler(&scaler);
+    if (SUCCEEDED(result)) result = scaler->Initialize(frame, width, height,
+                                                       WICBitmapInterpolationModeFant);
+    if (SUCCEEDED(result)) result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result)) result = converter->Initialize(
+        scaler, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+        WICBitmapPaletteTypeCustom);
+    IconImage logo;
+    if (SUCCEEDED(result)) {
+        logo.width = static_cast<int>(width);
+        logo.height = static_cast<int>(height);
+        logo.pixels.resize(static_cast<size_t>(width) * height);
+        result = converter->CopyPixels(nullptr, width * 4,
+                                       static_cast<UINT>(logo.pixels.size() * 4),
+                                       reinterpret_cast<BYTE*>(logo.pixels.data()));
+    }
+    if (converter) converter->Release();
+    if (scaler) scaler->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    if (FAILED(result)) return false;
+    gameIcon_ = std::move(logo);
+    return true;
 }
 
 void OverlayWindow::blendIcon(std::uint32_t* destination, int destinationWidth,
@@ -1233,6 +1386,13 @@ bool OverlayWindow::captureAndBlurBackground() {
 
 void OverlayWindow::renderAndPresent() {
     if (!framePixels_ || blurredBackground_.empty() || frameWidth_ <= 0) return;
+    if (achievementState_) {
+        const LONG sharedAppId = InterlockedCompareExchange(&achievementState_->appId, 0, 0);
+        if (sharedAppId > 0 && loadedGameLogoAppId_ != static_cast<unsigned int>(sharedAppId)) {
+            loadedGameLogoAppId_ = static_cast<unsigned int>(sharedAppId);
+            loadSteamGameLogo(loadedGameLogoAppId_);
+        }
+    }
     auto* output = static_cast<std::uint32_t*>(framePixels_);
     if (screen_ == Screen::Volume) initializeSystemVolume();
     const int panelWidth = screen_ == Screen::Volume ? 464 :
@@ -1276,7 +1436,7 @@ void OverlayWindow::renderAndPresent() {
             if (screen_ != Screen::MainBar &&
                 roundedRectangleCoverage(x, y, panelLeft, panelTop, panelRight,
                                          panelBottom, panelRadius) > 0.0f) {
-                constexpr BYTE panelAlpha = 244;
+                constexpr BYTE panelAlpha = 250;
                 constexpr double panelSourceWeight = 0.52;
                 const float coverage = roundedRectangleCoverage(
                     x, y, panelLeft, panelTop, panelRight, panelBottom, panelRadius);
@@ -1383,6 +1543,9 @@ void OverlayWindow::renderAndPresent() {
         blendIcon(output, frameWidth_, buttonIcons_[2], frameWidth_ / 2 + 195, barTop() - 34, 255);
     }
 
+    if (screen_ == Screen::MainBar)
+        blendIcon(output, frameWidth_, gameIcon_, 116, barTop() + 190, 255);
+
     const int iconCenters[] = {frameWidth_ / 2 - 190, frameWidth_ / 2, frameWidth_ / 2 + 190};
     for (int index = 0; index < 3; ++index) {
         blendIcon(output, frameWidth_, icons_[index], iconCenters[index], barTop() + 190,
@@ -1457,6 +1620,15 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             } else {
                 self->syncVisibilityWithGame();
                 self->pollController();
+                if (self->shown_ && self->screen_ == Screen::MainBar) {
+                    SYSTEMTIME localTime{};
+                    GetLocalTime(&localTime);
+                    const int clockMinute = localTime.wHour * 60 + localTime.wMinute;
+                    if (clockMinute != self->displayedClockMinute_) {
+                        self->displayedClockMinute_ = clockMinute;
+                        self->renderAndPresent();
+                    }
+                }
             }
         }
         return 0;

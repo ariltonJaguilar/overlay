@@ -4,7 +4,7 @@
 
 #include <string>
 
-constexpr LONG kAchievementSharedVersion = 1;
+constexpr LONG kAchievementSharedVersion = 2;
 constexpr LONG kMaximumSharedAchievements = 256;
 
 struct SharedAchievement {
@@ -24,6 +24,7 @@ struct SharedAchievement {
 
 struct AchievementSharedState {
     LONG version;
+    volatile LONG appId;
     volatile LONG status; // 0: carregando, 1: pronto, -1: indisponivel
     volatile LONG count;
     volatile LONG generation;
