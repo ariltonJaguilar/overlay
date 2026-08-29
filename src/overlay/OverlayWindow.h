@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <vector>
 
 class OverlayWindow {
@@ -45,6 +46,7 @@ private:
     void prepareForGameExit();
     void draw(HDC dc) const;
     bool captureAndBlurBackground();
+    std::vector<std::uint32_t> captureLiveBlurFrame() const;
     void renderAndPresent();
     void releaseRenderer();
     bool loadIcons();
@@ -76,6 +78,10 @@ private:
     bool enabled_ = false;
     bool shown_ = false;
     bool systemBackdrop_ = false;
+    bool liveCaptureSupported_ = false;
+    ULONGLONG nextLiveBlurUpdate_ = 0;
+    bool liveBlurInFlight_ = false;
+    std::future<std::vector<std::uint32_t>> liveBlurFuture_;
     int selectedItem_ = 0;
     enum class Screen { MainBar, Volume, Achievements, Screenshots, ScreenshotViewer,
                         Settings, Confirmation } screen_ = Screen::MainBar;
@@ -90,7 +96,6 @@ private:
     bool draggingVolume_ = false;
     bool closingGame_ = false;
     unsigned int exitGameAppId_ = 0;
-    ULONGLONG nextSteamFocusAttempt_ = 0;
     WORD previousControllerButtons_[XUSER_MAX_COUNT]{};
     IGameInput* gameInput_ = nullptr;
     GameInputGamepadButtons previousGameInputButtons_ = GameInputGamepadNone;

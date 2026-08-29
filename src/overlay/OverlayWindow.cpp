@@ -14,10 +14,27 @@
 #include <cwctype>
 
 namespace {
+enum class AccentState : int {
+    Disabled = 0,
+    BlurBehind = 3,
+    AcrylicBlurBehind = 4
+};
+struct AccentPolicy {
+    AccentState state;
+    DWORD flags;
+    DWORD gradientColor;
+    DWORD animationId;
+};
+struct WindowCompositionAttributeData {
+    int attribute;
+    void* data;
+    SIZE_T size;
+};
+constexpr int kWindowCompositionAttributeAccentPolicy = 19;
 constexpr wchar_t kWindowClass[] = L"GameOverlayMvp.Window";
 constexpr int kOverlayWidth = 620;
 constexpr int kBarHeight = 280;
-constexpr BYTE kGradientBottomOpacity = 250;
+constexpr BYTE kGradientBottomOpacity = 245;
 constexpr BYTE kPanelRed = 24;
 constexpr BYTE kPanelGreen = 24;
 constexpr BYTE kPanelBlue = 28;
@@ -375,7 +392,14 @@ void OverlayWindow::applyVisualStyle() {
     DwmSetWindowAttribute(window_, DWMWA_BORDER_COLOR, &noBorder, sizeof(noBorder));
     const LONG_PTR styles = GetWindowLongPtrW(window_, GWL_EXSTYLE);
     SetWindowLongPtrW(window_, GWL_EXSTYLE, styles | WS_EX_LAYERED);
-    systemBackdrop_ = false;
+    using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttributeData*);
+    const auto setComposition = reinterpret_cast<SetWindowCompositionAttributeFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+    AccentPolicy accent{AccentState::BlurBehind, 0, 0x101C1818u, 0};
+    WindowCompositionAttributeData accentData{kWindowCompositionAttributeAccentPolicy,
+                                               &accent, sizeof(accent)};
+    systemBackdrop_ = setComposition && setComposition(window_, &accentData) != FALSE;
+    liveCaptureSupported_ = false;
 }
 
 void OverlayWindow::centerOnGameMonitor() {
@@ -388,8 +412,8 @@ void OverlayWindow::centerOnGameMonitor() {
     GetMonitorInfoW(monitor, &info);
     const int width = info.rcMonitor.right - info.rcMonitor.left;
     const int monitorHeight = info.rcMonitor.bottom - info.rcMonitor.top;
-    frameHeight_ = (std::max)(480, monitorHeight - 56);
-    const int y = info.rcMonitor.bottom - frameHeight_;
+    frameHeight_ = (std::max)(480, monitorHeight);
+    const int y = info.rcMonitor.top;
     SetWindowPos(window_, HWND_TOPMOST, info.rcMonitor.left, y, width, frameHeight_, SWP_NOACTIVATE);
 }
 
@@ -420,6 +444,8 @@ void OverlayWindow::syncVisibilityWithGame() {
     setGameInputBlocked(shown_);
     if (shown_) {
         centerOnGameMonitor();
+        // Recrie o backdrop para o DWM nao reutilizar a ultima superficie oculta.
+        applyVisualStyle();
         if (!captureAndBlurBackground()) {
             shown_ = false;
             setGameInputBlocked(false);
@@ -428,6 +454,13 @@ void OverlayWindow::syncVisibilityWithGame() {
         renderAndPresent();
         ShowWindow(window_, SW_SHOWNOACTIVATE);
     } else {
+        using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttributeData*);
+        const auto setComposition = reinterpret_cast<SetWindowCompositionAttributeFn>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+        AccentPolicy disabled{AccentState::Disabled, 0, 0, 0};
+        WindowCompositionAttributeData data{kWindowCompositionAttributeAccentPolicy,
+                                             &disabled, sizeof(disabled)};
+        if (setComposition) setComposition(window_, &data);
         ShowWindow(window_, SW_HIDE);
         blurredBackground_.clear();
         if (!enabled_) {
@@ -658,7 +691,6 @@ void OverlayWindow::prepareForGameExit() {
     // vive em steamwebhelper.exe e nem sempre expoe um HWND principal enumeravel.
     openSteamLibraryGame(exitGameAppId_);
     focusSteamBigPicture();
-    nextSteamFocusAttempt_ = GetTickCount64() + 100;
 }
 
 bool OverlayWindow::initializeSystemVolume() {
@@ -1620,6 +1652,64 @@ bool OverlayWindow::captureAndBlurBackground() {
     return true;
 }
 
+std::vector<std::uint32_t> OverlayWindow::captureLiveBlurFrame() const {
+    if (!liveCaptureSupported_ || frameWidth_ <= 0 || frameHeight_ <= 0) return {};
+    RECT windowRect{};
+    GetWindowRect(window_, &windowRect);
+    constexpr int scaleDivisor = 8;
+    const int smallWidth = (std::max)(1, frameWidth_ / scaleDivisor);
+    const int smallHeight = (std::max)(1, frameHeight_ / scaleDivisor);
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = smallWidth;
+    info.bmiHeader.biHeight = -smallHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HDC screen = GetDC(nullptr);
+    HDC captureDc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!screen || !captureDc || !bitmap || !pixels) {
+        if (bitmap) DeleteObject(bitmap);
+        if (captureDc) DeleteDC(captureDc);
+        if (screen) ReleaseDC(nullptr, screen);
+        return {};
+    }
+    HGDIOBJ oldBitmap = SelectObject(captureDc, bitmap);
+    SetStretchBltMode(captureDc, HALFTONE);
+    SetBrushOrgEx(captureDc, 0, 0, nullptr);
+    const BOOL captured = StretchBlt(captureDc, 0, 0, smallWidth, smallHeight, screen,
+                                     windowRect.left, windowRect.top, frameWidth_, frameHeight_,
+                                     SRCCOPY | CAPTUREBLT);
+    std::vector<std::uint32_t> downsampled;
+    if (captured) {
+        const auto* source = static_cast<const std::uint32_t*>(pixels);
+        downsampled.assign(source, source + static_cast<size_t>(smallWidth) * smallHeight);
+    }
+    SelectObject(captureDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(captureDc);
+    ReleaseDC(nullptr, screen);
+    if (!captured) return {};
+
+    // O frame reduzido diminui drasticamente o custo e produz um blur mais macio.
+    boxBlur(downsampled, smallWidth, smallHeight, 11);
+    boxBlur(downsampled, smallWidth, smallHeight, 11);
+    boxBlur(downsampled, smallWidth, smallHeight, 11);
+    std::vector<std::uint32_t> result(static_cast<size_t>(frameWidth_) * frameHeight_);
+    for (int y = 0; y < frameHeight_; ++y) {
+        const int sourceY = (std::min)(smallHeight - 1, y * smallHeight / frameHeight_);
+        for (int x = 0; x < frameWidth_; ++x) {
+            const int sourceX = (std::min)(smallWidth - 1, x * smallWidth / frameWidth_);
+            result[static_cast<size_t>(y) * frameWidth_ + x] =
+                downsampled[static_cast<size_t>(sourceY) * smallWidth + sourceX];
+        }
+    }
+    return result;
+}
+
 void OverlayWindow::renderAndPresent() {
     if (!framePixels_ || blurredBackground_.empty() || frameWidth_ <= 0) return;
     if (achievementState_) {
@@ -1649,6 +1739,7 @@ void OverlayWindow::renderAndPresent() {
     const int panelLeft = (frameWidth_ - panelWidth) / 2;
     const int panelRight = panelLeft + panelWidth;
     const int panelRadius = (std::min)(kVolumePanelRadius, (panelBottom - panelTop) / 2);
+    SetWindowRgn(window_, nullptr, FALSE);
     for (int y = 0; y < frameHeight_; ++y) {
         const double progress = y >= barTop()
             ? static_cast<double>(y - barTop()) / (kBarHeight - 1) : 0.0;
@@ -1660,7 +1751,11 @@ void OverlayWindow::renderAndPresent() {
         const double tintWeight = 1.0 - sourceWeight;
         for (int x = 0; x < frameWidth_; ++x) {
             const size_t index = static_cast<size_t>(y) * frameWidth_ + x;
-            const auto source = blurredBackground_[index];
+            // Com backdrop do compositor, mantenha apenas a camada de cor/transparencia;
+            // o conteudo desfocado e atualizado vem diretamente do DWM.
+            // Sem backdrop global e sem reutilizar uma captura congelada: os painéis
+            // são apenas tonalizados e o jogo real permanece visível por transparência.
+            const auto source = 0u;
             const double blueTinted = (source & 0xff) * sourceWeight + kPanelBlue * tintWeight;
             const double greenTinted = ((source >> 8) & 0xff) * sourceWeight + kPanelGreen * tintWeight;
             const double redTinted = ((source >> 16) & 0xff) * sourceWeight + kPanelRed * tintWeight;
@@ -1675,7 +1770,7 @@ void OverlayWindow::renderAndPresent() {
             if (screen_ != Screen::MainBar &&
                 roundedRectangleCoverage(x, y, panelLeft, panelTop, panelRight,
                                          panelBottom, panelRadius) > 0.0f) {
-                const BYTE panelAlpha = screen_ == Screen::ScreenshotViewer ? 255 : 250;
+                const BYTE panelAlpha = screen_ == Screen::ScreenshotViewer ? 255 : 244;
                 const double panelSourceWeight = screen_ == Screen::ScreenshotViewer ? 0.22 : 0.52;
                 const float coverage = roundedRectangleCoverage(
                     x, y, panelLeft, panelTop, panelRight, panelBottom, panelRadius);
@@ -1710,11 +1805,16 @@ void OverlayWindow::renderAndPresent() {
                 const float coverage = roundedRectangleCoverage(x, y, left, top, right, bottom, 8);
                 if (coverage <= 0.0f) continue;
                 auto& pixel = output[static_cast<size_t>(y) * frameWidth_ + x];
-                const float multiplier = 1.0f - 0.30f * coverage;
+                const float darkAlpha = 0.34f * coverage;
+                const float multiplier = 1.0f - darkAlpha;
                 const BYTE blue = static_cast<BYTE>((pixel & 0xff) * multiplier);
                 const BYTE green = static_cast<BYTE>(((pixel >> 8) & 0xff) * multiplier);
                 const BYTE red = static_cast<BYTE>(((pixel >> 16) & 0xff) * multiplier);
-                pixel = (pixel & 0xff000000u) | (static_cast<std::uint32_t>(red) << 16) |
+                const BYTE oldAlpha = static_cast<BYTE>(pixel >> 24);
+                const BYTE alpha = static_cast<BYTE>(255.0f * darkAlpha +
+                                                     oldAlpha * (1.0f - darkAlpha));
+                pixel = (static_cast<std::uint32_t>(alpha) << 24) |
+                        (static_cast<std::uint32_t>(red) << 16) |
                         (static_cast<std::uint32_t>(green) << 8) | blue;
             }
         }
@@ -1890,20 +1990,33 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     case WM_TIMER:
         if (self && wParam == kProcessTimerId) {
             if (WaitForSingleObject(self->gameProcess_, 0) == WAIT_OBJECT_0) {
-                if (self->closingGame_) {
-                    openSteamLibraryGame(self->exitGameAppId_);
-                    focusSteamBigPicture();
-                }
                 DestroyWindow(window);
             } else if (self->closingGame_) {
-                const ULONGLONG now = GetTickCount64();
-                if (now >= self->nextSteamFocusAttempt_) {
-                    focusSteamBigPicture();
-                    self->nextSteamFocusAttempt_ = now + 250;
-                }
+                // Nao force novamente o foco da Steam enquanto ela aguarda o jogo fechar.
+                // Isso permite que Alt+Tab funcione normalmente na tela "Terminando".
             } else {
                 self->syncVisibilityWithGame();
                 self->pollController();
+                const ULONGLONG now = GetTickCount64();
+                if (self->liveBlurInFlight_ &&
+                    self->liveBlurFuture_.wait_for(std::chrono::milliseconds(0)) ==
+                        std::future_status::ready) {
+                    auto liveFrame = self->liveBlurFuture_.get();
+                    self->liveBlurInFlight_ = false;
+                    // Sem espera artificial: solicite o proximo frame imediatamente.
+                    self->nextLiveBlurUpdate_ = now;
+                    if (self->shown_ && !liveFrame.empty()) {
+                        self->blurredBackground_ = std::move(liveFrame);
+                        self->renderAndPresent();
+                    }
+                }
+                if (self->liveCaptureSupported_ && self->shown_ && !self->liveBlurInFlight_ &&
+                    now >= self->nextLiveBlurUpdate_) {
+                    self->liveBlurInFlight_ = true;
+                    self->liveBlurFuture_ = std::async(std::launch::async, [self] {
+                        return self->captureLiveBlurFrame();
+                    });
+                }
                 if (self->shown_ && self->achievementState_) {
                     const LONG sharedAppId = InterlockedCompareExchange(
                         &self->achievementState_->appId, 0, 0);
