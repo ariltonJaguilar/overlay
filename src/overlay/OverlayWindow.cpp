@@ -781,12 +781,26 @@ void OverlayWindow::draw(HDC dc) const {
         HGDIOBJ oldTitleFont = SelectObject(dc, titleFont);
         SetTextColor(dc, RGB(248, 249, 252));
         RECT titleRect{};
+        std::wstring titleText;
         const wchar_t* title = nullptr;
         if (screen_ == Screen::Volume) {
             title = L"Volume";
             titleRect = RECT{0, sliderY() - 76, width, sliderY() - 30};
         } else if (screen_ == Screen::Achievements) {
-            title = L"Conquistas";
+            titleText = L"Conquistas";
+            if (achievementState_ &&
+                InterlockedCompareExchange(&achievementState_->status, 0, 0) == 1) {
+                const int total = std::clamp(static_cast<int>(
+                    InterlockedCompareExchange(&achievementState_->count, 0, 0)),
+                    0, static_cast<int>(kMaximumSharedAchievements));
+                int unlocked = 0;
+                for (int index = 0; index < total; ++index) {
+                    if (achievementState_->achievements[index].unlocked != FALSE) ++unlocked;
+                }
+                titleText += L" (" + std::to_wstring(unlocked) + L"/" +
+                             std::to_wstring(total) + L")";
+            }
+            title = titleText.c_str();
             titleRect = RECT{0, 27, width, 76};
         } else {
             title = L"Configura\u00e7\u00f5" L"es";
@@ -1134,23 +1148,55 @@ bool OverlayWindow::loadSteamGameLogo(unsigned int appId) {
 
     const auto cache = std::filesystem::path(steamPath) / L"appcache" / L"librarycache";
     const std::wstring appIdText = std::to_wstring(appId);
-    std::filesystem::path logoPath = cache / (appIdText + L"_logo.png");
+    std::filesystem::path logoPath;
     std::error_code error;
-    if (!std::filesystem::is_regular_file(logoPath, error)) {
-        logoPath.clear();
-        const auto appCache = cache / appIdText;
-        for (std::filesystem::directory_iterator item(appCache, error), end;
-             !error && item != end; item.increment(error)) {
-            if (!item->is_regular_file(error)) continue;
-            std::wstring filename = item->path().filename().wstring();
-            std::transform(filename.begin(), filename.end(), filename.begin(),
+    const auto supportedImage = [](const std::filesystem::path& path) {
+        std::wstring extension = path.extension().wstring();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+        return extension == L".png" || extension == L".jpg" || extension == L".jpeg" ||
+               extension == L".gif";
+    };
+
+    // Logos personalizados (incluindo SteamGridDB) têm prioridade sobre a arte padrão.
+    const auto userdata = std::filesystem::path(steamPath) / L"userdata";
+    for (std::filesystem::directory_iterator user(userdata, error), end;
+         logoPath.empty() && !error && user != end; user.increment(error)) {
+        if (!user->is_directory(error)) continue;
+        const auto grid = user->path() / L"config" / L"grid";
+        for (std::filesystem::directory_iterator item(grid, error), gridEnd;
+             !error && item != gridEnd; item.increment(error)) {
+            if (!item->is_regular_file(error) || !supportedImage(item->path())) continue;
+            std::wstring stem = item->path().stem().wstring();
+            std::transform(stem.begin(), stem.end(), stem.begin(),
                            [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
-            if (filename.find(L"logo") != std::wstring::npos &&
-                item->path().extension() == L".png") {
+            if (stem == appIdText + L"_logo") {
                 logoPath = item->path();
                 break;
             }
         }
+        error.clear();
+    }
+    error.clear();
+
+    // O cache atual costuma usar <AppID>/<hash>/logo.png; versões anteriores
+    // também gravavam diretamente em <AppID>/ ou como <AppID>_logo.png.
+    const auto appCache = cache / appIdText;
+    for (std::filesystem::recursive_directory_iterator item(appCache, error), end;
+         logoPath.empty() && !error && item != end; item.increment(error)) {
+        if (!item->is_regular_file(error) || !supportedImage(item->path())) continue;
+        std::wstring filename = item->path().filename().wstring();
+        std::transform(filename.begin(), filename.end(), filename.begin(),
+                       [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+        if (filename == L"logo.png" || filename.find(L"_logo.") != std::wstring::npos) {
+            logoPath = item->path();
+            break;
+        }
+    }
+    error.clear();
+    if (logoPath.empty()) {
+        const auto legacyLogo = cache / (appIdText + L"_logo.png");
+        if (std::filesystem::is_regular_file(legacyLogo, error)) logoPath = legacyLogo;
     }
     if (logoPath.empty()) return false;
 
@@ -1620,6 +1666,13 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             } else {
                 self->syncVisibilityWithGame();
                 self->pollController();
+                if (self->shown_ && self->achievementState_) {
+                    const LONG sharedAppId = InterlockedCompareExchange(
+                        &self->achievementState_->appId, 0, 0);
+                    if (sharedAppId > 0 && self->loadedGameLogoAppId_ !=
+                                             static_cast<unsigned int>(sharedAppId))
+                        self->renderAndPresent();
+                }
                 if (self->shown_ && self->screen_ == Screen::MainBar) {
                     SYSTEMTIME localTime{};
                     GetLocalTime(&localTime);

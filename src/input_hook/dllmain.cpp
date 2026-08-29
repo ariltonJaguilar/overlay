@@ -288,6 +288,9 @@ void collectSteamAchievements() {
             GetProcAddress(steam, "SteamAPI_ISteamUtils_GetAppID"));
         auto getStatInt = reinterpret_cast<GetStatIntFn>(
             GetProcAddress(steam, "SteamAPI_ISteamUserStats_GetStatInt32"));
+        void* steamUtils = getUtils ? getUtils() : nullptr;
+        const unsigned int appId = steamUtils && getAppId ? getAppId(steamUtils) : 0;
+        InterlockedExchange(&shared->appId, static_cast<LONG>(appId));
         if (!getInterface || !getCount || !getName || !getState || !getAttribute) break;
 
         void* stats = getInterface();
@@ -311,9 +314,6 @@ void collectSteamAchievements() {
             std::transform(steamLanguage.begin(), steamLanguage.end(), steamLanguage.begin(),
                            [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
         }
-        void* steamUtils = getUtils ? getUtils() : nullptr;
-        const unsigned int appId = steamUtils && getAppId ? getAppId(steamUtils) : 0;
-        InterlockedExchange(&shared->appId, static_cast<LONG>(appId));
         const auto schema = appId ? steamAchievementSchema(appId) : std::vector<unsigned char>{};
         auto reloadIcon = [&](SharedAchievement& target) {
             if (!steamUtils || !getIcon || !getImageSize || !getImageRgba) return false;
