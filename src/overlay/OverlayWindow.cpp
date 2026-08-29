@@ -543,7 +543,13 @@ void OverlayWindow::syncVisibilityWithGame() {
 
     const bool shouldShow = enabled_ && (foregroundPid == gamePid_ || foregroundWindow == window_ ||
                                          (shown_ && wandOperationInFlight_));
-    if (shouldShow == shown_) return;
+    if (shouldShow == shown_) {
+        // Treat the shared flag as asserted state, not a one-shot transition.
+        // Focus/API changes during Alt+Tab can otherwise leave the game reading
+        // input while the overlay still considers itself visible.
+        setGameInputBlocked(shouldShow);
+        return;
+    }
 
     shown_ = shouldShow;
     setGameInputBlocked(shown_);
