@@ -394,6 +394,11 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
     InterlockedExchange(&sharedState_->controllerThumbLY, 0);
     InterlockedExchange(&sharedState_->toggleOverlayRequest, FALSE);
     InterlockedExchange(&sharedState_->controllerUpdateTick, 0);
+    InterlockedExchange(&sharedState_->xinputCallCount, 0);
+    InterlockedExchange(&sharedState_->blockedXinputCallCount, 0);
+    InterlockedExchange(&sharedState_->rawInputCallCount, 0);
+    InterlockedExchange(&sharedState_->hidParserCallCount, 0);
+    InterlockedExchange(&sharedState_->hidReadCallCount, 0);
 
     const std::wstring achievementName = achievementSharedMemoryName(gamePid);
     achievementMapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,

@@ -1,8 +1,0 @@
-E:/Desktop/overlay/build-win32/CMakeFiles/OverlayInputHook.dir
-E:/Desktop/overlay/build-win32/CMakeFiles/GameOverlayInjector32.dir
-E:/Desktop/overlay/build-win32/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-win32/CMakeFiles/ALL_BUILD.dir
-E:/Desktop/overlay/build-win32/CMakeFiles/ZERO_CHECK.dir
-E:/Desktop/overlay/build-win32/third_party/minhook/CMakeFiles/minhook.dir
-E:/Desktop/overlay/build-win32/third_party/minhook/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-win32/third_party/minhook/CMakeFiles/ALL_BUILD.dir

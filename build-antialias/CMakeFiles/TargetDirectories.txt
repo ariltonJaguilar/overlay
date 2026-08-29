@@ -1,9 +1,0 @@
-E:/Desktop/overlay/build-antialias/CMakeFiles/GameOverlayManager.dir
-E:/Desktop/overlay/build-antialias/CMakeFiles/Overlay.dir
-E:/Desktop/overlay/build-antialias/CMakeFiles/OverlayInputHook.dir
-E:/Desktop/overlay/build-antialias/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-antialias/CMakeFiles/ALL_BUILD.dir
-E:/Desktop/overlay/build-antialias/CMakeFiles/ZERO_CHECK.dir
-E:/Desktop/overlay/build-antialias/third_party/minhook/CMakeFiles/minhook.dir
-E:/Desktop/overlay/build-antialias/third_party/minhook/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-antialias/third_party/minhook/CMakeFiles/ALL_BUILD.dir

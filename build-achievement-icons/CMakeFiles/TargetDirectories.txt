@@ -1,9 +1,0 @@
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/GameOverlayManager.dir
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/Overlay.dir
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/OverlayInputHook.dir
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/ALL_BUILD.dir
-E:/Desktop/overlay/build-achievement-icons/CMakeFiles/ZERO_CHECK.dir
-E:/Desktop/overlay/build-achievement-icons/third_party/minhook/CMakeFiles/minhook.dir
-E:/Desktop/overlay/build-achievement-icons/third_party/minhook/CMakeFiles/INSTALL.dir
-E:/Desktop/overlay/build-achievement-icons/third_party/minhook/CMakeFiles/ALL_BUILD.dir

@@ -15,7 +15,7 @@ add_library(OverlayInputHook SHARED
 )
 
 target_include_directories(OverlayInputHook PRIVATE src/common)
-target_link_libraries(OverlayInputHook PRIVATE minhook)
+target_link_libraries(OverlayInputHook PRIVATE minhook runtimeobject)
 
 target_compile_definitions(OverlayInputHook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 

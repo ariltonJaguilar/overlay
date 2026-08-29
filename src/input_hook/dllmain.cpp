@@ -2,7 +2,12 @@
 #include "AchievementShared.h"
 
 #include <MinHook.h>
+#include <GameInput.h>
+#include <mmsystem.h>
 #include <windows.h>
+#include <hidsdi.h>
+#include <roapi.h>
+#include <windows.gaming.input.h>
 #include <xinput.h>
 
 #include <array>
@@ -20,14 +25,44 @@
 
 namespace {
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+using XInputGetKeystrokeFn = DWORD(WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
 
 constexpr size_t kMaximumHooks = 16;
 std::array<XInputGetStateFn, kMaximumHooks> g_originalFunctions{};
 std::array<void*, kMaximumHooks> g_hookedTargets{};
 size_t g_hookCount = 0;
+std::array<XInputGetKeystrokeFn, kMaximumHooks> g_originalKeystrokeFunctions{};
+std::array<void*, kMaximumHooks> g_hookedKeystrokeTargets{};
+size_t g_keystrokeHookCount = 0;
 HANDLE g_sharedMapping = nullptr;
 InputSharedState* g_sharedState = nullptr;
 bool g_toggleChordHeld = false;
+using GameInputGetGamepadStateFn = bool(STDMETHODCALLTYPE*)(
+    IGameInputReading*, GameInputGamepadState*);
+GameInputGetGamepadStateFn g_originalGameInputGetGamepadState = nullptr;
+void* g_gameInputGetGamepadStateTarget = nullptr;
+HMODULE g_gameInputModule = nullptr;
+using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+using GetRawInputBufferFn = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
+using JoyGetPosFn = MMRESULT(WINAPI*)(UINT, LPJOYINFO);
+using JoyGetPosExFn = MMRESULT(WINAPI*)(UINT, LPJOYINFOEX);
+GetRawInputDataFn g_originalGetRawInputData = nullptr;
+GetRawInputBufferFn g_originalGetRawInputBuffer = nullptr;
+JoyGetPosFn g_originalJoyGetPos = nullptr;
+JoyGetPosExFn g_originalJoyGetPosEx = nullptr;
+bool g_rawInputHooksInstalled = false;
+bool g_winmmHooksInstalled = false;
+using HidPGetDataFn = NTSTATUS(WINAPI*)(HIDP_REPORT_TYPE, PHIDP_DATA, PULONG,
+                                       PHIDP_PREPARSED_DATA, PCHAR, ULONG);
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+HidPGetDataFn g_originalHidPGetData = nullptr;
+ReadFileFn g_originalReadFile = nullptr;
+bool g_directHidHooksInstalled = false;
+using WgiGamepad = ABI::Windows::Gaming::Input::IGamepad;
+using WgiGamepadReading = ABI::Windows::Gaming::Input::GamepadReading;
+using WgiGetCurrentReadingFn = HRESULT(STDMETHODCALLTYPE*)(WgiGamepad*, WgiGamepadReading*);
+WgiGetCurrentReadingFn g_originalWgiGetCurrentReading = nullptr;
+void* g_wgiGetCurrentReadingTarget = nullptr;
 
 std::wstring registryText(HKEY root, const wchar_t* name, DWORD flags = 0) {
     wchar_t value[32768]{};
@@ -116,6 +151,126 @@ bool inputMustBeBlocked() {
            InterlockedCompareExchange(&g_sharedState->blockGameInput, 0, 0) != 0;
 }
 
+bool STDMETHODCALLTYPE hookedGameInputGetGamepadState(
+    IGameInputReading* reading, GameInputGamepadState* state) {
+    const bool result = g_originalGameInputGetGamepadState &&
+                        g_originalGameInputGetGamepadState(reading, state);
+    if (result && state && inputMustBeBlocked()) {
+        ZeroMemory(state, sizeof(*state));
+    }
+    return result;
+}
+
+void neutralizeRawInput(RAWINPUT* input) {
+    if (!input || input->header.dwType != RIM_TYPEHID) return;
+    const size_t byteCount = static_cast<size_t>(input->data.hid.dwSizeHid) *
+                             input->data.hid.dwCount;
+    if (byteCount) ZeroMemory(input->data.hid.bRawData, byteCount);
+}
+
+UINT WINAPI hookedGetRawInputData(HRAWINPUT input, UINT command, LPVOID data,
+                                  PUINT size, UINT headerSize) {
+    const UINT result = g_originalGetRawInputData
+        ? g_originalGetRawInputData(input, command, data, size, headerSize)
+        : static_cast<UINT>(-1);
+    if (result != static_cast<UINT>(-1) && command == RID_INPUT && data &&
+        result >= sizeof(RAWINPUTHEADER) && inputMustBeBlocked()) {
+        if (openSharedState()) InterlockedIncrement(&g_sharedState->rawInputCallCount);
+        auto* rawInput = static_cast<RAWINPUT*>(data);
+        if (rawInput->header.dwType == RIM_TYPEHID) {
+            // Nao entregue o relatorio ao backend da Unity. Zerar os bytes nao
+            // basta: remove tambem o report ID e pode fazer a engine conservar
+            // o ultimo estado valido do controle.
+            neutralizeRawInput(rawInput);
+            return 0;
+        }
+    }
+    return result;
+}
+
+NTSTATUS WINAPI hookedHidPGetData(HIDP_REPORT_TYPE reportType, PHIDP_DATA data,
+                                  PULONG dataLength, PHIDP_PREPARSED_DATA preparsedData,
+                                  PCHAR report, ULONG reportLength) {
+    const NTSTATUS result = g_originalHidPGetData
+        ? g_originalHidPGetData(reportType, data, dataLength, preparsedData, report, reportLength)
+        : static_cast<NTSTATUS>(0xC0110001L);
+    if (reportType == HidP_Input && inputMustBeBlocked()) {
+        if (openSharedState()) InterlockedIncrement(&g_sharedState->hidParserCallCount);
+        if (dataLength) *dataLength = 0;
+    }
+    return result;
+}
+
+BOOL WINAPI hookedReadFile(HANDLE file, LPVOID buffer, DWORD bytesToRead,
+                           LPDWORD bytesRead, LPOVERLAPPED overlapped) {
+    if (inputMustBeBlocked() && GetFileType(file) == FILE_TYPE_CHAR) {
+        if (openSharedState()) InterlockedIncrement(&g_sharedState->hidReadCallCount);
+        if (bytesRead) *bytesRead = 0;
+        if (overlapped) {
+            overlapped->Internal = 0;
+            overlapped->InternalHigh = 0;
+        }
+        return TRUE;
+    }
+    return g_originalReadFile
+        ? g_originalReadFile(file, buffer, bytesToRead, bytesRead, overlapped)
+        : FALSE;
+}
+
+HRESULT STDMETHODCALLTYPE hookedWgiGetCurrentReading(WgiGamepad* gamepad,
+                                                     WgiGamepadReading* reading) {
+    const HRESULT result = g_originalWgiGetCurrentReading
+        ? g_originalWgiGetCurrentReading(gamepad, reading) : E_FAIL;
+    if (SUCCEEDED(result) && reading && inputMustBeBlocked()) {
+        const UINT64 timestamp = reading->Timestamp;
+        ZeroMemory(reading, sizeof(*reading));
+        reading->Timestamp = timestamp;
+    }
+    return result;
+}
+
+UINT WINAPI hookedGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize) {
+    const UINT result = g_originalGetRawInputBuffer
+        ? g_originalGetRawInputBuffer(data, size, headerSize)
+        : static_cast<UINT>(-1);
+    if (result == static_cast<UINT>(-1) || !data || !result || !inputMustBeBlocked()) {
+        return result;
+    }
+    RAWINPUT* current = data;
+    bool containsHid = false;
+    for (UINT index = 0; index < result; ++index) {
+        containsHid = containsHid || current->header.dwType == RIM_TYPEHID;
+        neutralizeRawInput(current);
+        const auto next = reinterpret_cast<ULONG_PTR>(current) + current->header.dwSize;
+        current = reinterpret_cast<RAWINPUT*>(
+            (next + sizeof(void*) - 1) & ~(static_cast<ULONG_PTR>(sizeof(void*) - 1)));
+    }
+    // O buffer pode misturar varios relatorios. Durante o overlay, descarte o
+    // lote que contenha HID para impedir que a Unity atualize seu estado por
+    // uma segunda rota depois de XInput ter sido neutralizado.
+    return containsHid ? 0 : result;
+}
+
+MMRESULT WINAPI hookedJoyGetPos(UINT id, LPJOYINFO info) {
+    const MMRESULT result = g_originalJoyGetPos ? g_originalJoyGetPos(id, info) : MMSYSERR_ERROR;
+    if (result == JOYERR_NOERROR && info && inputMustBeBlocked()) {
+        info->wXpos = info->wYpos = info->wZpos = 0x7fff;
+        info->wButtons = 0;
+    }
+    return result;
+}
+
+MMRESULT WINAPI hookedJoyGetPosEx(UINT id, LPJOYINFOEX info) {
+    const MMRESULT result = g_originalJoyGetPosEx ? g_originalJoyGetPosEx(id, info) : MMSYSERR_ERROR;
+    if (result == JOYERR_NOERROR && info && inputMustBeBlocked()) {
+        info->dwXpos = info->dwYpos = info->dwZpos = 0x7fff;
+        info->dwRpos = info->dwUpos = info->dwVpos = 0x7fff;
+        info->dwButtons = info->dwButtonNumber = 0;
+        info->dwPOV = JOY_POVCENTERED;
+    }
+    return result;
+}
+
 void publishControllerState(const XINPUT_STATE* state, bool connected) {
     if (!openSharedState()) return;
     if (!connected || !state) {
@@ -140,6 +295,9 @@ DWORD WINAPI hookedXInputGetState(DWORD userIndex, XINPUT_STATE* state) {
     // O controle principal e o indice zero. Nao deixe as sondagens dos slots
     // vazios (1-3) apagarem o estado que o overlay acabou de receber.
     if (userIndex == 0) publishControllerState(state, result == ERROR_SUCCESS);
+    if (userIndex == 0 && openSharedState()) {
+        InterlockedIncrement(&g_sharedState->xinputCallCount);
+    }
     if (userIndex == 0 && result == ERROR_SUCCESS && state) {
         const WORD chord = XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK;
         const bool chordHeld = (state->Gamepad.wButtons & chord) == chord;
@@ -150,6 +308,9 @@ DWORD WINAPI hookedXInputGetState(DWORD userIndex, XINPUT_STATE* state) {
         if (chordHeld) state->Gamepad.wButtons &= static_cast<WORD>(~chord);
     }
     if (inputMustBeBlocked()) {
+        if (userIndex == 0 && openSharedState()) {
+            InterlockedIncrement(&g_sharedState->blockedXinputCallCount);
+        }
         // Preserve o estado de conexao percebido pelo jogo. Quando o controle
         // existe, entregamos um quadro neutro em vez de simular a desconexao.
         if (result == ERROR_SUCCESS && state) {
@@ -168,6 +329,26 @@ constexpr auto makeHookFunctions(std::index_sequence<Indices...>) {
 }
 
 constexpr auto kHookFunctions = makeHookFunctions(std::make_index_sequence<kMaximumHooks>{});
+
+template <size_t Index>
+DWORD WINAPI hookedXInputGetKeystroke(DWORD userIndex, DWORD reserved,
+                                      PXINPUT_KEYSTROKE keystroke) {
+    const auto original = g_originalKeystrokeFunctions[Index];
+    const DWORD result = original ? original(userIndex, reserved, keystroke)
+                                  : static_cast<DWORD>(ERROR_EMPTY);
+    if (!inputMustBeBlocked()) return result;
+    if (keystroke) ZeroMemory(keystroke, sizeof(*keystroke));
+    return ERROR_EMPTY;
+}
+
+template <size_t... Indices>
+constexpr auto makeKeystrokeHookFunctions(std::index_sequence<Indices...>) {
+    return std::array<XInputGetKeystrokeFn, sizeof...(Indices)>{
+        &hookedXInputGetKeystroke<Indices>...};
+}
+
+constexpr auto kKeystrokeHookFunctions =
+    makeKeystrokeHookFunctions(std::make_index_sequence<kMaximumHooks>{});
 
 bool alreadyHooked(void* target) {
     for (size_t index = 0; index < g_hookCount; ++index) {
@@ -222,11 +403,29 @@ void hookTarget(void* target) {
     ++g_hookCount;
 }
 
+void hookKeystrokeTarget(void* target) {
+    if (!target || g_keystrokeHookCount >= kMaximumHooks) return;
+    for (size_t index = 0; index < g_keystrokeHookCount; ++index) {
+        if (g_hookedKeystrokeTargets[index] == target) return;
+    }
+    const size_t slot = g_keystrokeHookCount;
+    if (MH_CreateHook(target, reinterpret_cast<void*>(kKeystrokeHookFunctions[slot]),
+                      reinterpret_cast<void**>(&g_originalKeystrokeFunctions[slot])) != MH_OK) return;
+    if (MH_EnableHook(target) != MH_OK) {
+        MH_RemoveHook(target);
+        g_originalKeystrokeFunctions[slot] = nullptr;
+        return;
+    }
+    g_hookedKeystrokeTargets[slot] = target;
+    ++g_keystrokeHookCount;
+}
+
 void hookXInputModule(const wchar_t* moduleName) {
     const HMODULE module = GetModuleHandleW(moduleName);
     if (!module) return;
     hookTarget(reinterpret_cast<void*>(GetProcAddress(module, "XInputGetState")));
     hookTarget(reinterpret_cast<void*>(GetProcAddress(module, MAKEINTRESOURCEA(100))));
+    hookKeystrokeTarget(reinterpret_cast<void*>(GetProcAddress(module, "XInputGetKeystroke")));
 }
 
 void collectSteamAchievements() {
@@ -495,19 +694,177 @@ void collectSteamAchievements() {
     CloseHandle(mapping);
 }
 
+DWORD WINAPI collectSteamAchievementsThread(void*) {
+    collectSteamAchievements();
+    return 0;
+}
+
+void hookLoadedXInputModules() {
+    constexpr const wchar_t* modules[] = {
+        L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll",
+        L"xinput1_2.dll", L"xinput1_1.dll", L"xinputuap.dll",
+    };
+    for (const wchar_t* module : modules) hookXInputModule(module);
+}
+
+void hookGameInput() {
+    if (g_gameInputGetGamepadStateTarget) return;
+    if (!g_gameInputModule) g_gameInputModule = LoadLibraryW(L"gameinput.dll");
+    if (!g_gameInputModule) return;
+
+    using GameInputCreateFn = HRESULT(WINAPI*)(IGameInput**);
+    const auto create = reinterpret_cast<GameInputCreateFn>(
+        GetProcAddress(g_gameInputModule, "GameInputCreate"));
+    if (!create) return;
+
+    IGameInput* gameInput = nullptr;
+    IGameInputReading* reading = nullptr;
+    if (FAILED(create(&gameInput)) || !gameInput) return;
+    const HRESULT readingResult = gameInput->GetCurrentReading(
+        GameInputKindGamepad, nullptr, &reading);
+    gameInput->Release();
+    if (FAILED(readingResult) || !reading) return;
+
+    // IGameInputReading::GetGamepadState e a entrada 22 da vtable
+    // (IUnknown ocupa as tres primeiras entradas).
+    void* target = (*reinterpret_cast<void***>(reading))[22];
+    reading->Release();
+    if (!target) return;
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&hookedGameInputGetGamepadState),
+                      reinterpret_cast<void**>(&g_originalGameInputGetGamepadState)) != MH_OK) {
+        g_originalGameInputGetGamepadState = nullptr;
+        return;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        MH_RemoveHook(target);
+        g_originalGameInputGetGamepadState = nullptr;
+        return;
+    }
+    g_gameInputGetGamepadStateTarget = target;
+}
+
+bool createAndEnableHook(void* target, void* detour, void** original) {
+    if (!target || !detour || !original) return false;
+    if (MH_CreateHook(target, detour, original) != MH_OK) return false;
+    if (MH_EnableHook(target) == MH_OK) return true;
+    MH_RemoveHook(target);
+    *original = nullptr;
+    return false;
+}
+
+void hookRawInput() {
+    if (g_rawInputHooksInstalled) return;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    void* dataTarget = reinterpret_cast<void*>(GetProcAddress(user32, "GetRawInputData"));
+    void* bufferTarget = reinterpret_cast<void*>(GetProcAddress(user32, "GetRawInputBuffer"));
+    const bool dataHooked = g_originalGetRawInputData || createAndEnableHook(
+        dataTarget, reinterpret_cast<void*>(&hookedGetRawInputData),
+        reinterpret_cast<void**>(&g_originalGetRawInputData));
+    const bool bufferHooked = g_originalGetRawInputBuffer || createAndEnableHook(
+        bufferTarget, reinterpret_cast<void*>(&hookedGetRawInputBuffer),
+        reinterpret_cast<void**>(&g_originalGetRawInputBuffer));
+    g_rawInputHooksInstalled = dataHooked && bufferHooked;
+}
+
+void hookWinmmJoystick() {
+    if (g_winmmHooksInstalled) return;
+    HMODULE winmm = GetModuleHandleW(L"winmm.dll");
+    if (!winmm) return;
+    void* posTarget = reinterpret_cast<void*>(GetProcAddress(winmm, "joyGetPos"));
+    void* posExTarget = reinterpret_cast<void*>(GetProcAddress(winmm, "joyGetPosEx"));
+    const bool posHooked = g_originalJoyGetPos || createAndEnableHook(
+        posTarget, reinterpret_cast<void*>(&hookedJoyGetPos),
+        reinterpret_cast<void**>(&g_originalJoyGetPos));
+    const bool posExHooked = g_originalJoyGetPosEx || createAndEnableHook(
+        posExTarget, reinterpret_cast<void*>(&hookedJoyGetPosEx),
+        reinterpret_cast<void**>(&g_originalJoyGetPosEx));
+    g_winmmHooksInstalled = posHooked && posExHooked;
+}
+
+void hookDirectHid() {
+    if (g_directHidHooksInstalled) return;
+    HMODULE hid = GetModuleHandleW(L"hid.dll");
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hid || !kernel32) return;
+    void* hidDataTarget = reinterpret_cast<void*>(GetProcAddress(hid, "HidP_GetData"));
+    void* readFileTarget = reinterpret_cast<void*>(GetProcAddress(kernel32, "ReadFile"));
+    const bool hidDataHooked = g_originalHidPGetData || createAndEnableHook(
+        hidDataTarget, reinterpret_cast<void*>(&hookedHidPGetData),
+        reinterpret_cast<void**>(&g_originalHidPGetData));
+    const bool readFileHooked = g_originalReadFile || createAndEnableHook(
+        readFileTarget, reinterpret_cast<void*>(&hookedReadFile),
+        reinterpret_cast<void**>(&g_originalReadFile));
+    g_directHidHooksInstalled = hidDataHooked && readFileHooked;
+}
+
+void hookWindowsGamingInput() {
+    if (g_wgiGetCurrentReadingTarget) return;
+    const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) return;
+
+    HSTRING className = nullptr;
+    if (FAILED(WindowsCreateString(RuntimeClass_Windows_Gaming_Input_Gamepad,
+                                   static_cast<UINT32>(
+                                       wcslen(RuntimeClass_Windows_Gaming_Input_Gamepad)),
+                                   &className))) return;
+    ABI::Windows::Gaming::Input::IGamepadStatics* statics = nullptr;
+    const HRESULT factoryResult = RoGetActivationFactory(
+        className, __uuidof(ABI::Windows::Gaming::Input::IGamepadStatics),
+        reinterpret_cast<void**>(&statics));
+    WindowsDeleteString(className);
+    if (FAILED(factoryResult) || !statics) return;
+
+    __FIVectorView_1_Windows__CGaming__CInput__CGamepad* gamepads = nullptr;
+    const HRESULT listResult = statics->get_Gamepads(&gamepads);
+    statics->Release();
+    if (FAILED(listResult) || !gamepads) return;
+    UINT32 count = 0;
+    gamepads->get_Size(&count);
+    WgiGamepad* gamepad = nullptr;
+    if (count) gamepads->GetAt(0, &gamepad);
+    gamepads->Release();
+    if (!gamepad) return;
+
+    void* target = (*reinterpret_cast<void***>(gamepad))[8];
+    gamepad->Release();
+    if (!target) return;
+    if (createAndEnableHook(target, reinterpret_cast<void*>(&hookedWgiGetCurrentReading),
+                            reinterpret_cast<void**>(&g_originalWgiGetCurrentReading))) {
+        g_wgiGetCurrentReadingTarget = target;
+    }
+}
+
 DWORD WINAPI initializeHook(void*) {
     // O manager ja espera o jogo ganhar foco; damos mais um instante para a engine estabilizar.
     Sleep(1500);
     openSharedState();
     if (MH_Initialize() != MH_OK) return 0;
 
-    constexpr const wchar_t* modules[] = {
-        L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll",
-        L"xinput1_2.dll", L"xinput1_1.dll", L"xinputuap.dll",
-    };
-    for (const wchar_t* module : modules) hookXInputModule(module);
-    collectSteamAchievements();
-    return 0;
+    hookLoadedXInputModules();
+    hookGameInput();
+    hookRawInput();
+    hookWinmmJoystick();
+    hookDirectHid();
+    hookWindowsGamingInput();
+
+    // A Steam Input e algumas engines carregam (ou trocam) a implementacao de
+    // XInput depois da inicializacao do jogo. A sondagem unica deixava essas
+    // chamadas fora do hook: o overlay recebia o controle, mas o jogo tambem.
+    // Mantenha a coleta da Steam em outra thread e acompanhe modulos tardios.
+    if (HANDLE thread = CreateThread(nullptr, 0, collectSteamAchievementsThread,
+                                     nullptr, 0, nullptr)) {
+        CloseHandle(thread);
+    }
+    for (;;) {
+        Sleep(1000);
+        hookLoadedXInputModules();
+        hookGameInput();
+        hookRawInput();
+        hookWinmmJoystick();
+        hookDirectHid();
+        hookWindowsGamingInput();
+    }
 }
 } // namespace
 
