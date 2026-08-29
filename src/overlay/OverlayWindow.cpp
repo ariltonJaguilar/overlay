@@ -106,6 +106,13 @@ bool focusSteamBigPicture() {
     return focused;
 }
 
+void openSteamLibraryGame(unsigned int appId) {
+    ShellExecuteW(nullptr, L"open", L"steam://open/bigpicture", nullptr, nullptr, SW_SHOWNORMAL);
+    if (!appId) return;
+    const std::wstring gameDetails = L"steam://nav/games/details/" + std::to_wstring(appId);
+    ShellExecuteW(nullptr, L"open", gameDetails.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 void drawAchievementIcon(HDC dc, int x, int y, COLORREF color) {
     HPEN pen = CreatePen(PS_SOLID, 3, color);
     HGDIOBJ oldPen = SelectObject(dc, pen);
@@ -574,6 +581,11 @@ void OverlayWindow::executeSettingsAction() {
 
 void OverlayWindow::prepareForGameExit() {
     closingGame_ = true;
+    if (achievementState_) {
+        const LONG sharedAppId = InterlockedCompareExchange(&achievementState_->appId, 0, 0);
+        if (sharedAppId > 0) exitGameAppId_ = static_cast<unsigned int>(sharedAppId);
+    }
+    if (!exitGameAppId_) exitGameAppId_ = loadedGameLogoAppId_;
     enabled_ = false;
     shown_ = false;
     draggingVolume_ = false;
@@ -590,7 +602,7 @@ void OverlayWindow::prepareForGameExit() {
     }
     // Deixe a propria Steam restaurar/ativar o Big Picture. A interface atual
     // vive em steamwebhelper.exe e nem sempre expoe um HWND principal enumeravel.
-    ShellExecuteW(window_, L"open", L"steam://open/bigpicture", nullptr, nullptr, SW_SHOWNORMAL);
+    openSteamLibraryGame(exitGameAppId_);
     focusSteamBigPicture();
     nextSteamFocusAttempt_ = GetTickCount64() + 100;
 }
@@ -1655,7 +1667,10 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     case WM_TIMER:
         if (self && wParam == kProcessTimerId) {
             if (WaitForSingleObject(self->gameProcess_, 0) == WAIT_OBJECT_0) {
-                if (self->closingGame_) focusSteamBigPicture();
+                if (self->closingGame_) {
+                    openSteamLibraryGame(self->exitGameAppId_);
+                    focusSteamBigPicture();
+                }
                 DestroyWindow(window);
             } else if (self->closingGame_) {
                 const ULONGLONG now = GetTickCount64();

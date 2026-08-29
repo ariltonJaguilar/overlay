@@ -84,6 +84,7 @@ private:
     float volumeLevel_ = 0.0f;
     bool draggingVolume_ = false;
     bool closingGame_ = false;
+    unsigned int exitGameAppId_ = 0;
     ULONGLONG nextSteamFocusAttempt_ = 0;
     WORD previousControllerButtons_[XUSER_MAX_COUNT]{};
     IGameInput* gameInput_ = nullptr;
