@@ -372,6 +372,8 @@ bool OverlayWindow::create(HINSTANCE instance, DWORD gamePid) {
 
     applyVisualStyle();
     centerOnGameMonitor();
+    if (gameWindowCoversMonitor()) startupCoverActive_ = false;
+    else showStartupCover();
 
     if (!RegisterHotKey(window_, kHotkeyId, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'O')) {
         MessageBoxW(nullptr, L"Nao foi possivel registrar Ctrl+Shift+O.", L"Overlay MVP", MB_OK | MB_ICONWARNING);
@@ -415,6 +417,71 @@ void OverlayWindow::centerOnGameMonitor() {
     frameHeight_ = (std::max)(480, monitorHeight);
     const int y = info.rcMonitor.top;
     SetWindowPos(window_, HWND_TOPMOST, info.rcMonitor.left, y, width, frameHeight_, SWP_NOACTIVATE);
+}
+
+bool OverlayWindow::gameWindowCoversMonitor() const {
+    WindowSearch search{gamePid_, nullptr};
+    EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&search));
+    if (!search.result || IsIconic(search.result)) return false;
+    RECT windowRect{};
+    if (FAILED(DwmGetWindowAttribute(search.result, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                     &windowRect, sizeof(windowRect))))
+        GetWindowRect(search.result, &windowRect);
+    const HMONITOR monitor = MonitorFromWindow(search.result, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{}; info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return false;
+    constexpr int tolerance = 3;
+    return windowRect.left <= info.rcMonitor.left + tolerance &&
+           windowRect.top <= info.rcMonitor.top + tolerance &&
+           windowRect.right >= info.rcMonitor.right - tolerance &&
+           windowRect.bottom >= info.rcMonitor.bottom - tolerance;
+}
+
+void OverlayWindow::showStartupCover() {
+    releaseStartupCover();
+    RECT rect{}; GetWindowRect(window_, &rect);
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HDC screen = GetDC(nullptr);
+    startupCoverDc_ = CreateCompatibleDC(screen);
+    startupCoverBitmap_ = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (startupCoverDc_ && startupCoverBitmap_ && pixels) {
+        std::fill_n(static_cast<std::uint32_t*>(pixels),
+                    static_cast<size_t>(width) * height, 0xff000000u);
+        startupCoverOldBitmap_ = SelectObject(startupCoverDc_, startupCoverBitmap_);
+        startupCoverOpacity_ = 0;
+        startupFadeInStart_ = GetTickCount64();
+        updateStartupCover(startupCoverOpacity_);
+        ShowWindow(window_, SW_SHOWNOACTIVATE);
+    }
+    if (screen) ReleaseDC(nullptr, screen);
+    startupCoverDeadline_ = GetTickCount64() + 30000;
+}
+
+void OverlayWindow::updateStartupCover(BYTE opacity) {
+    if (!startupCoverDc_ || !startupCoverBitmap_) return;
+    RECT rect{}; GetWindowRect(window_, &rect);
+    POINT destination{rect.left, rect.top}, source{0, 0};
+    SIZE size{rect.right - rect.left, rect.bottom - rect.top};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, opacity, AC_SRC_ALPHA};
+    HDC screen = GetDC(nullptr);
+    UpdateLayeredWindow(window_, screen, &destination, &size, startupCoverDc_, &source,
+                        0, &blend, ULW_ALPHA);
+    ReleaseDC(nullptr, screen);
+}
+
+void OverlayWindow::releaseStartupCover() {
+    if (startupCoverDc_ && startupCoverOldBitmap_) {
+        SelectObject(startupCoverDc_, startupCoverOldBitmap_);
+        startupCoverOldBitmap_ = nullptr;
+    }
+    if (startupCoverBitmap_) { DeleteObject(startupCoverBitmap_); startupCoverBitmap_ = nullptr; }
+    if (startupCoverDc_) { DeleteDC(startupCoverDc_); startupCoverDc_ = nullptr; }
 }
 
 void OverlayWindow::toggleVisibility() {
@@ -1952,6 +2019,7 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     switch (message) {
     case WM_NCHITTEST: {
         if (!self) return HTCLIENT;
+        if (self->startupCoverActive_) return HTTRANSPARENT;
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(window, &point);
         if (point.y >= self->barTop()) return HTCLIENT;
@@ -1991,6 +2059,41 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         if (self && wParam == kProcessTimerId) {
             if (WaitForSingleObject(self->gameProcess_, 0) == WAIT_OBJECT_0) {
                 DestroyWindow(window);
+            } else if (self->startupCoverActive_) {
+                const ULONGLONG now = GetTickCount64();
+                DWORD foregroundPid = 0;
+                const HWND foreground = GetForegroundWindow();
+                if (foreground) GetWindowThreadProcessId(foreground, &foregroundPid);
+                ShowWindow(window, foregroundPid == self->gamePid_ ? SW_SHOWNOACTIVATE : SW_HIDE);
+                if (!self->startupFadeStart_) {
+                    constexpr ULONGLONG fadeInDuration = 250;
+                    const ULONGLONG fadeInElapsed = now - self->startupFadeInStart_;
+                    const BYTE opacity = static_cast<BYTE>((std::min)(
+                        ULONGLONG{255}, fadeInElapsed * 255 / fadeInDuration));
+                    if (opacity != self->startupCoverOpacity_) {
+                        self->startupCoverOpacity_ = opacity;
+                        self->updateStartupCover(opacity);
+                    }
+                }
+                if (!self->startupFadeStart_ &&
+                    (self->gameWindowCoversMonitor() || now >= self->startupCoverDeadline_)) {
+                    self->startupFadeStart_ = now;
+                    self->startupFadeOutOpacity_ = self->startupCoverOpacity_;
+                }
+                if (self->startupFadeStart_) {
+                    constexpr ULONGLONG fadeDuration = 300;
+                    const ULONGLONG elapsed = now - self->startupFadeStart_;
+                    if (elapsed >= fadeDuration) {
+                        self->startupCoverActive_ = false;
+                        self->releaseStartupCover();
+                        ShowWindow(window, SW_HIDE);
+                        self->syncVisibilityWithGame();
+                    } else {
+                        self->startupCoverOpacity_ = static_cast<BYTE>(
+                            self->startupFadeOutOpacity_ * (fadeDuration - elapsed) / fadeDuration);
+                        self->updateStartupCover(self->startupCoverOpacity_);
+                    }
+                }
             } else if (self->closingGame_) {
                 // Nao force novamente o foco da Steam enquanto ela aguarda o jogo fechar.
                 // Isso permite que Alt+Tab funcione normalmente na tela "Terminando".
@@ -2160,6 +2263,7 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     }
     case WM_DESTROY:
         if (self) {
+            self->releaseStartupCover();
             self->setGameInputBlocked(false);
             self->releaseRenderer();
             if (self->keyboardHook_) UnhookWindowsHookEx(self->keyboardHook_);

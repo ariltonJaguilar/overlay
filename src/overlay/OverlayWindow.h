@@ -31,6 +31,10 @@ private:
     static LRESULT CALLBACK keyboardHookProc(int code, WPARAM wParam, LPARAM lParam);
     bool create(HINSTANCE instance, DWORD gamePid);
     void applyVisualStyle();
+    void showStartupCover();
+    void updateStartupCover(BYTE opacity);
+    void releaseStartupCover();
+    bool gameWindowCoversMonitor() const;
     void toggleVisibility();
     void syncVisibilityWithGame();
     void centerOnGameMonitor();
@@ -77,6 +81,15 @@ private:
     DWORD gamePid_ = 0;
     bool enabled_ = false;
     bool shown_ = false;
+    bool startupCoverActive_ = true;
+    ULONGLONG startupCoverDeadline_ = 0;
+    ULONGLONG startupFadeInStart_ = 0;
+    ULONGLONG startupFadeStart_ = 0;
+    BYTE startupCoverOpacity_ = 0;
+    BYTE startupFadeOutOpacity_ = 255;
+    HDC startupCoverDc_ = nullptr;
+    HBITMAP startupCoverBitmap_ = nullptr;
+    HGDIOBJ startupCoverOldBitmap_ = nullptr;
     bool systemBackdrop_ = false;
     bool liveCaptureSupported_ = false;
     ULONGLONG nextLiveBlurUpdate_ = 0;

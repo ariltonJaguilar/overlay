@@ -629,7 +629,7 @@ int managerLoop(int argc, wchar_t* argv[]) {
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 } // namespace
