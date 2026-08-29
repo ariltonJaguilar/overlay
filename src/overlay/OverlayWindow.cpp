@@ -153,6 +153,17 @@ void drawSettingsIcon(HDC dc, int x, int y, COLORREF color) {
     SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
 }
 
+void drawScreenshotIcon(HDC dc, int x, int y, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 3, color);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, x - 27, y - 18, x + 27, y + 20, 7, 7);
+    Ellipse(dc, x - 10, y - 10, x + 10, y + 10);
+    MoveToEx(dc, x - 17, y - 18, nullptr); LineTo(dc, x - 10, y - 26);
+    LineTo(dc, x + 5, y - 26); LineTo(dc, x + 12, y - 18);
+    SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
+}
+
 void boxBlur(std::vector<std::uint32_t>& pixels, int width, int height, int radius) {
     std::vector<std::uint32_t> temporary(pixels.size());
     auto blurPass = [&](const std::vector<std::uint32_t>& source,
@@ -495,7 +506,13 @@ void OverlayWindow::moveSelection(int direction) {
         renderAndPresent();
         return;
     }
-    selectedItem_ = (selectedItem_ + direction + 3) % 3;
+    if (screen_ == Screen::Screenshots) {
+        const int count = static_cast<int>(screenshotPaths_.size());
+        if (count > 0) screenshotSelection_ = std::clamp(screenshotSelection_ + direction, 0, count - 1);
+        renderAndPresent();
+        return;
+    }
+    selectedItem_ = (selectedItem_ + direction + 4) % 4;
     renderAndPresent();
 }
 
@@ -522,8 +539,40 @@ void OverlayWindow::activateSelection() {
         return;
     }
     if (screen_ == Screen::MainBar && selectedItem_ == 2) {
+        loadScreenshots();
+        screen_ = Screen::Screenshots;
+        renderAndPresent();
+        return;
+    }
+    if (screen_ == Screen::MainBar && selectedItem_ == 3) {
         settingsSelection_ = 0;
         screen_ = Screen::Settings;
+        renderAndPresent();
+        return;
+    }
+    if (screen_ == Screen::Screenshots && !screenshotPaths_.empty()) {
+        screenshotViewerImage_ = {};
+        loadImageFile(screenshotPaths_[static_cast<size_t>(screenshotSelection_)],
+                      frameWidth_ - 100, barTop() - 110, screenshotViewerImage_);
+        constexpr int cornerRadius = 18;
+        for (int y = 0; y < screenshotViewerImage_.height; ++y) {
+            for (int x = 0; x < screenshotViewerImage_.width; ++x) {
+                const float coverage = roundedRectangleCoverage(
+                    x, y, 0, 0, screenshotViewerImage_.width,
+                    screenshotViewerImage_.height, cornerRadius);
+                auto& pixel = screenshotViewerImage_.pixels[
+                    static_cast<size_t>(y) * screenshotViewerImage_.width + x];
+                if (coverage >= 1.0f) continue;
+                const BYTE blue = static_cast<BYTE>((pixel & 0xff) * coverage);
+                const BYTE green = static_cast<BYTE>(((pixel >> 8) & 0xff) * coverage);
+                const BYTE red = static_cast<BYTE>(((pixel >> 16) & 0xff) * coverage);
+                const BYTE alpha = static_cast<BYTE>(((pixel >> 24) & 0xff) * coverage);
+                pixel = (static_cast<std::uint32_t>(alpha) << 24) |
+                        (static_cast<std::uint32_t>(red) << 16) |
+                        (static_cast<std::uint32_t>(green) << 8) | blue;
+            }
+        }
+        screen_ = Screen::ScreenshotViewer;
         renderAndPresent();
         return;
     }
@@ -543,10 +592,15 @@ void OverlayWindow::activateSelection() {
 }
 
 void OverlayWindow::goBack() {
-    if (screen_ == Screen::Confirmation) {
+    if (screen_ == Screen::ScreenshotViewer) {
+        screenshotViewerImage_ = {};
+        screen_ = Screen::Screenshots;
+        renderAndPresent();
+    } else if (screen_ == Screen::Confirmation) {
         screen_ = Screen::Settings;
         renderAndPresent();
     } else if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
+               screen_ == Screen::Screenshots ||
                screen_ == Screen::Settings) {
         draggingVolume_ = false;
         screen_ = Screen::MainBar;
@@ -696,7 +750,12 @@ void OverlayWindow::pollController() {
             InterlockedCompareExchange(&sharedState_->controllerThumbLY, 0, 0));
         const WORD pressed = static_cast<WORD>(buttons & ~previousSharedControllerButtons_);
         int direction = 0;
-        if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+        if (screen_ == Screen::Screenshots) {
+            if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || thumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -4;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || thumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 4;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || thumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || thumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
+        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || thumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || thumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -724,7 +783,12 @@ void OverlayWindow::pollController() {
                     static_cast<unsigned int>(buttons) &
                     ~static_cast<unsigned int>(previousGameInputButtons_));
                 int direction = 0;
-                if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+                if (screen_ == Screen::Screenshots) {
+                    if ((buttons & GameInputGamepadDPadUp) || state.leftThumbstickY > 0.35f) direction = -4;
+                    else if ((buttons & GameInputGamepadDPadDown) || state.leftThumbstickY < -0.35f) direction = 4;
+                    else if ((buttons & GameInputGamepadDPadLeft) || state.leftThumbstickX < -0.35f) direction = -1;
+                    else if ((buttons & GameInputGamepadDPadRight) || state.leftThumbstickX > 0.35f) direction = 1;
+                } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
                     if ((buttons & GameInputGamepadDPadUp) || state.leftThumbstickY > 0.35f) direction = -1;
                     else if ((buttons & GameInputGamepadDPadDown) || state.leftThumbstickY < -0.35f) direction = 1;
                 } else {
@@ -756,7 +820,12 @@ void OverlayWindow::pollController() {
         const WORD buttons = state.Gamepad.wButtons;
         const WORD pressed = static_cast<WORD>(buttons & ~previousControllerButtons_[userIndex]);
         int direction = 0;
-        if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+        if (screen_ == Screen::Screenshots) {
+            if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -4;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 4;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
+            else if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
+        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -786,6 +855,7 @@ void OverlayWindow::draw(HDC dc) const {
     const int width = client.right - client.left;
     SetBkMode(dc, TRANSPARENT);
     if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
+        screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer ||
         screen_ == Screen::Settings) {
         HFONT titleFont = CreateFontW(44, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -814,6 +884,9 @@ void OverlayWindow::draw(HDC dc) const {
             }
             title = titleText.c_str();
             titleRect = RECT{0, 27, width, 76};
+        } else if (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) {
+            title = screen_ == Screen::Screenshots ? L"Galeria" : L"SCREENSHOT";
+            titleRect = RECT{0, 27, width, 76};
         } else {
             title = L"Configura\u00e7\u00f5" L"es";
             titleRect = RECT{0, menuOffset() - 23, width, menuOffset() + 22};
@@ -821,6 +894,17 @@ void OverlayWindow::draw(HDC dc) const {
         DrawTextW(dc, title, -1, &titleRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         SelectObject(dc, oldTitleFont);
         DeleteObject(titleFont);
+    }
+    if (screen_ == Screen::Screenshots && screenshotPaths_.empty()) {
+        HFONT font = CreateFontW(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetTextColor(dc, RGB(205, 207, 214));
+        RECT message{0, 140, width, 230};
+        DrawTextW(dc, L"Nenhuma screenshot encontrada", -1, &message,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, oldFont); DeleteObject(font);
     }
     if (screen_ == Screen::Settings || screen_ == Screen::Confirmation) {
         HFONT font = CreateFontW(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -1000,7 +1084,7 @@ void OverlayWindow::draw(HDC dc) const {
         SelectObject(dc, oldBrush); SelectObject(dc, oldPen); SelectObject(dc, oldFont);
         DeleteObject(descriptionFont); DeleteObject(nameFont);
     }
-    const int centers[] = {width / 2 - 190, width / 2, width / 2 + 190};
+    const int centers[] = {width / 2 - 285, width / 2 - 95, width / 2 + 95, width / 2 + 285};
 
     if (screen_ == Screen::MainBar) {
         SYSTEMTIME localTime{};
@@ -1019,12 +1103,13 @@ void OverlayWindow::draw(HDC dc) const {
         DeleteObject(clockFont);
     }
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const COLORREF color = RGB(245, 246, 250);
         if (icons_[i].pixels.empty()) {
             if (i == 0) drawAchievementIcon(dc, centers[i], barTop() + 190, color);
             if (i == 1) drawVolumeIcon(dc, centers[i], barTop() + 190, color);
-            if (i == 2) drawSettingsIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 2) drawScreenshotIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 3) drawSettingsIcon(dc, centers[i], barTop() + 190, color);
         }
     }
 }
@@ -1035,7 +1120,8 @@ bool OverlayWindow::loadIcons() {
                                             static_cast<DWORD>(std::size(executablePath)));
     const auto directory = std::filesystem::path(std::wstring(executablePath, length)).parent_path();
     const wchar_t* filenames[] = {
-        L"trophy.png", L"volume.png", L"settings.png", L"x.png", L"y.png", L"b.png"
+        L"trophy.png", L"volume.png", L"screenshot.png", L"settings.png",
+        L"x.png", L"y.png", L"b.png"
     };
     bool allLoaded = true;
 
@@ -1043,13 +1129,13 @@ bool OverlayWindow::loadIcons() {
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&factory)))) return false;
 
-    for (int index = 0; index < 6; ++index) {
-        IconImage& destination = index < 3 ? icons_[index] : buttonIcons_[index - 3];
+    for (int index = 0; index < 7; ++index) {
+        IconImage& destination = index < 4 ? icons_[index] : buttonIcons_[index - 4];
         IWICBitmapDecoder* decoder = nullptr;
         IWICBitmapFrameDecode* frame = nullptr;
         IWICBitmapScaler* scaler = nullptr;
         IWICFormatConverter* converter = nullptr;
-        const auto path = directory / L"assets" / (index < 3 ? L"icons" : L"buttons") / filenames[index];
+        const auto path = directory / L"assets" / (index < 4 ? L"icons" : L"buttons") / filenames[index];
         HRESULT result = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
                                                              WICDecodeMetadataCacheOnLoad, &decoder);
         if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
@@ -1057,7 +1143,7 @@ bool OverlayWindow::loadIcons() {
         if (SUCCEEDED(result)) result = frame->GetSize(&sourceWidth, &sourceHeight);
         UINT width = 1, height = 1;
         if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
-            const double maximumSize = index < 3 ? 60.0 : 30.0;
+            const double maximumSize = index < 4 ? 60.0 : 30.0;
             const double scale = (std::min)(maximumSize / sourceWidth, maximumSize / sourceHeight);
             width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
             height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
@@ -1254,6 +1340,98 @@ bool OverlayWindow::loadSteamGameLogo(unsigned int appId) {
     if (FAILED(result)) return false;
     gameIcon_ = std::move(logo);
     return true;
+}
+
+bool OverlayWindow::loadImageFile(const std::filesystem::path& path, int maximumWidth,
+                                  int maximumHeight, IconImage& destination) const {
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(result)) result = factory->CreateDecoderFromFilename(
+        path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
+    UINT sourceWidth = 0, sourceHeight = 0;
+    if (SUCCEEDED(result)) result = frame->GetSize(&sourceWidth, &sourceHeight);
+    UINT width = 1, height = 1;
+    if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
+        const double scale = (std::min)({1.0, static_cast<double>(maximumWidth) / sourceWidth,
+                                        static_cast<double>(maximumHeight) / sourceHeight});
+        width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
+        height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
+    }
+    if (SUCCEEDED(result)) result = factory->CreateBitmapScaler(&scaler);
+    if (SUCCEEDED(result)) result = scaler->Initialize(frame, width, height, WICBitmapInterpolationModeFant);
+    if (SUCCEEDED(result)) result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result)) result = converter->Initialize(
+        scaler, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+        WICBitmapPaletteTypeCustom);
+    IconImage image;
+    if (SUCCEEDED(result)) {
+        image.width = static_cast<int>(width); image.height = static_cast<int>(height);
+        image.pixels.resize(static_cast<size_t>(width) * height);
+        result = converter->CopyPixels(nullptr, width * 4,
+            static_cast<UINT>(image.pixels.size() * 4), reinterpret_cast<BYTE*>(image.pixels.data()));
+    }
+    if (converter) converter->Release(); if (scaler) scaler->Release();
+    if (frame) frame->Release(); if (decoder) decoder->Release(); if (factory) factory->Release();
+    if (FAILED(result)) return false;
+    destination = std::move(image);
+    return true;
+}
+
+void OverlayWindow::loadScreenshots() {
+    screenshotPaths_.clear(); screenshotThumbnails_.clear(); screenshotSelection_ = 0;
+    const unsigned int appId = loadedGameLogoAppId_;
+    if (!appId) return;
+    wchar_t steamPath[32768]{}; DWORD bytes = sizeof(steamPath);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath",
+                     RRF_RT_REG_SZ, nullptr, steamPath, &bytes) != ERROR_SUCCESS) return;
+    const auto userdata = std::filesystem::path(steamPath) / L"userdata";
+    std::error_code error;
+    for (std::filesystem::directory_iterator user(userdata, error), end;
+         !error && user != end; user.increment(error)) {
+        const auto folder = user->path() / L"760" / L"remote" /
+                            std::to_wstring(appId) / L"screenshots";
+        std::error_code folderError;
+        for (std::filesystem::directory_iterator item(folder, folderError), itemEnd;
+             !folderError && item != itemEnd; item.increment(folderError)) {
+            if (!item->is_regular_file(folderError)) continue;
+            std::wstring extension = item->path().extension().wstring();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+            if (extension == L".jpg" || extension == L".jpeg" || extension == L".png")
+                screenshotPaths_.push_back(item->path());
+        }
+    }
+    std::sort(screenshotPaths_.begin(), screenshotPaths_.end(), [](const auto& left, const auto& right) {
+        std::error_code a, b;
+        return std::filesystem::last_write_time(left, a) > std::filesystem::last_write_time(right, b);
+    });
+    screenshotThumbnails_.resize(screenshotPaths_.size());
+    for (size_t index = 0; index < screenshotPaths_.size(); ++index) {
+        auto& thumbnail = screenshotThumbnails_[index];
+        if (!loadImageFile(screenshotPaths_[index], 230, 129, thumbnail)) continue;
+        constexpr int cornerRadius = 12;
+        for (int y = 0; y < thumbnail.height; ++y) {
+            for (int x = 0; x < thumbnail.width; ++x) {
+                const float coverage = roundedRectangleCoverage(
+                    x, y, 0, 0, thumbnail.width, thumbnail.height, cornerRadius);
+                if (coverage >= 1.0f) continue;
+                auto& pixel = thumbnail.pixels[static_cast<size_t>(y) * thumbnail.width + x];
+                const BYTE blue = static_cast<BYTE>((pixel & 0xff) * coverage);
+                const BYTE green = static_cast<BYTE>(((pixel >> 8) & 0xff) * coverage);
+                const BYTE red = static_cast<BYTE>(((pixel >> 16) & 0xff) * coverage);
+                const BYTE alpha = static_cast<BYTE>(((pixel >> 24) & 0xff) * coverage);
+                pixel = (static_cast<std::uint32_t>(alpha) << 24) |
+                        (static_cast<std::uint32_t>(red) << 16) |
+                        (static_cast<std::uint32_t>(green) << 8) | blue;
+            }
+        }
+    }
 }
 
 void OverlayWindow::blendIcon(std::uint32_t* destination, int destinationWidth,
@@ -1456,13 +1634,16 @@ void OverlayWindow::renderAndPresent() {
     const int panelWidth = screen_ == Screen::Volume ? 464 :
                            screen_ == Screen::Settings ? 500 :
                            screen_ == Screen::Achievements ? kAchievementPanelWidth :
+                           (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? 1100 :
                            screen_ == Screen::Confirmation ? 430 : kVolumePanelWidth;
     const int panelTop = screen_ == Screen::Volume ? sliderY() - 84 :
                          screen_ == Screen::Achievements ? 18 :
+                         (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? 18 :
                          screen_ == Screen::Settings ? menuOffset() - 28 :
                          screen_ == Screen::Confirmation ? menuOffset() + 34 : sliderY() - 22;
     const int panelBottom = screen_ == Screen::Volume ? sliderY() + 22 :
                             screen_ == Screen::Achievements ? barTop() - 6 :
+                            (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? barTop() - 6 :
                             screen_ == Screen::Settings ? menuOffset() + 178 :
                             screen_ == Screen::Confirmation ? menuOffset() + 159 : sliderY() + 22;
     const int panelLeft = (frameWidth_ - panelWidth) / 2;
@@ -1494,8 +1675,8 @@ void OverlayWindow::renderAndPresent() {
             if (screen_ != Screen::MainBar &&
                 roundedRectangleCoverage(x, y, panelLeft, panelTop, panelRight,
                                          panelBottom, panelRadius) > 0.0f) {
-                constexpr BYTE panelAlpha = 250;
-                constexpr double panelSourceWeight = 0.52;
+                const BYTE panelAlpha = screen_ == Screen::ScreenshotViewer ? 255 : 250;
+                const double panelSourceWeight = screen_ == Screen::ScreenshotViewer ? 0.22 : 0.52;
                 const float coverage = roundedRectangleCoverage(
                     x, y, panelLeft, panelTop, panelRight, panelBottom, panelRadius);
                 const BYTE coveredAlpha = static_cast<BYTE>(panelAlpha * coverage);
@@ -1600,14 +1781,50 @@ void OverlayWindow::renderAndPresent() {
         blendIcon(output, frameWidth_, buttonIcons_[1], frameWidth_ / 2 - 80, barTop() - 34, 255);
         blendIcon(output, frameWidth_, buttonIcons_[2], frameWidth_ / 2 + 195, barTop() - 34, 255);
     }
+    if (screen_ == Screen::Screenshots && !screenshotThumbnails_.empty()) {
+        constexpr int columns = 4;
+        const int rows = (std::max)(1, (barTop() - 115) / 165);
+        const int capacity = columns * rows;
+        const int selectedRow = screenshotSelection_ / columns;
+        const int firstRow = (std::max)(0, selectedRow - rows + 1);
+        const int first = firstRow * columns;
+        for (int slot = 0; slot < capacity && first + slot < static_cast<int>(screenshotThumbnails_.size()); ++slot) {
+            const int column = slot % columns;
+            const int row = slot / columns;
+            const int centerX = frameWidth_ / 2 + (column - 1) * 250 - 125;
+            const int centerY = 120 + row * 165 + 70;
+            if (first + slot == screenshotSelection_) {
+                const int left = centerX - 121, right = centerX + 121;
+                const int top = centerY - 71, bottom = centerY + 71;
+                for (int y = top; y < bottom; ++y) {
+                    for (int x = left; x < right; ++x) {
+                        if (x < 0 || x >= frameWidth_ || y < 0 || y >= frameHeight_) continue;
+                        const float outer = roundedRectangleCoverage(x, y, left, top, right, bottom, 10);
+                        const float inner = roundedRectangleCoverage(x, y, left + 4, top + 4,
+                                                                     right - 4, bottom - 4, 7);
+                        if (outer > 0.0f && inner < 1.0f)
+                            output[static_cast<size_t>(y) * frameWidth_ + x] = 0xffeeeef2u;
+                    }
+                }
+            }
+            blendIcon(output, frameWidth_, screenshotThumbnails_[static_cast<size_t>(first + slot)],
+                      centerX, centerY, 255);
+        }
+    } else if (screen_ == Screen::ScreenshotViewer && !screenshotViewerImage_.pixels.empty()) {
+        blendIcon(output, frameWidth_, screenshotViewerImage_, frameWidth_ / 2,
+                  84 + (barTop() - 94) / 2, 255);
+    }
 
     if (screen_ == Screen::MainBar)
         blendIcon(output, frameWidth_, gameIcon_, 116, barTop() + 190, 255);
 
-    const int iconCenters[] = {frameWidth_ / 2 - 190, frameWidth_ / 2, frameWidth_ / 2 + 190};
-    for (int index = 0; index < 3; ++index) {
-        blendIcon(output, frameWidth_, icons_[index], iconCenters[index], barTop() + 190,
-                  index == selectedItem_ ? 255 : 82);
+    if (screen_ != Screen::ScreenshotViewer) {
+        const int iconCenters[] = {frameWidth_ / 2 - 285, frameWidth_ / 2 - 95,
+                                   frameWidth_ / 2 + 95, frameWidth_ / 2 + 285};
+        for (int index = 0; index < 4; ++index) {
+            blendIcon(output, frameWidth_, icons_[index], iconCenters[index], barTop() + 190,
+                      index == selectedItem_ ? 255 : 82);
+        }
     }
     SelectObject(uiDc, oldUiBitmap);
     DeleteDC(uiDc);
@@ -1642,13 +1859,19 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             const int panelWidth = self->screen_ == Screen::Volume ? 464 :
                                    self->screen_ == Screen::Settings ? 500 :
                                    self->screen_ == Screen::Achievements ? kAchievementPanelWidth :
+                                   (self->screen_ == Screen::Screenshots ||
+                                    self->screen_ == Screen::ScreenshotViewer) ? 1100 :
                                    self->screen_ == Screen::Confirmation ? 430 : kVolumePanelWidth;
             const int panelTop = self->screen_ == Screen::Volume ? self->sliderY() - 84 :
                                  self->screen_ == Screen::Achievements ? 18 :
+                                 (self->screen_ == Screen::Screenshots ||
+                                  self->screen_ == Screen::ScreenshotViewer) ? 18 :
                                  self->screen_ == Screen::Settings ? self->menuOffset() - 28 :
                                  self->screen_ == Screen::Confirmation ? self->menuOffset() + 34 : self->sliderY() - 22;
             const int panelBottom = self->screen_ == Screen::Volume ? self->sliderY() + 22 :
                                     self->screen_ == Screen::Achievements ? self->barTop() - 6 :
+                                    (self->screen_ == Screen::Screenshots ||
+                                     self->screen_ == Screen::ScreenshotViewer) ? self->barTop() - 6 :
                                     self->screen_ == Screen::Settings ? self->menuOffset() + 178 :
                                     self->screen_ == Screen::Confirmation ? self->menuOffset() + 159 : self->sliderY() + 22;
             const int left = (self->frameWidth_ - panelWidth) / 2;
@@ -1704,6 +1927,8 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         if (!self) return 0;
         if (wParam == VK_LEFT) self->moveSelection(-1);
         else if (wParam == VK_RIGHT) self->moveSelection(1);
+        else if (wParam == VK_UP && self->screen_ == Screen::Screenshots) self->moveSelection(-4);
+        else if (wParam == VK_DOWN && self->screen_ == Screen::Screenshots) self->moveSelection(4);
         else if (wParam == VK_UP && (self->screen_ == Screen::Settings ||
                                      self->screen_ == Screen::Achievements)) self->moveSelection(-1);
         else if (wParam == VK_DOWN && (self->screen_ == Screen::Settings ||
@@ -1746,6 +1971,8 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     case WM_MOUSEWHEEL:
         if (self && self->screen_ == Screen::Achievements) {
             self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
+        } else if (self && self->screen_ == Screen::Screenshots) {
+            self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -4 : 4);
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -1763,6 +1990,22 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
                 return 0;
             }
             const int y = GET_Y_LPARAM(lParam);
+            if (self->screen_ == Screen::Screenshots && y >= 120 && y < self->barTop()) {
+                constexpr int columns = 4;
+                const int rows = (std::max)(1, (self->barTop() - 115) / 165);
+                const int selectedRow = self->screenshotSelection_ / columns;
+                const int firstRow = (std::max)(0, selectedRow - rows + 1);
+                const int column = (x - (self->frameWidth_ / 2 - 500)) / 250;
+                const int row = (y - 120) / 165;
+                if (column >= 0 && column < columns && row >= 0 && row < rows) {
+                    const int selected = firstRow * columns + row * columns + column;
+                    if (selected < static_cast<int>(self->screenshotPaths_.size())) {
+                        self->screenshotSelection_ = selected;
+                        self->activateSelection();
+                    }
+                }
+                return 0;
+            }
             if (self->screen_ == Screen::Settings) {
                 if (y >= self->menuOffset() + 31 && y < self->menuOffset() + 181) {
                     self->settingsSelection_ = std::clamp((y - (self->menuOffset() + 31)) / 50, 0, 2);
@@ -1786,8 +2029,9 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             RECT client{};
             GetClientRect(window, &client);
             const int center = client.right / 2;
-            if (x >= center - 270 && x <= center + 270) {
-                self->selectedItem_ = (x < center - 95) ? 0 : (x < center + 95 ? 1 : 2);
+            if (x >= center - 380 && x <= center + 380) {
+                self->selectedItem_ = x < center - 190 ? 0 : x < center ? 1 :
+                                      x < center + 190 ? 2 : 3;
                 self->renderAndPresent();
                 self->activateSelection();
             }

@@ -9,6 +9,7 @@
 #include "AchievementShared.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <vector>
 
 class OverlayWindow {
@@ -49,6 +50,9 @@ private:
     bool loadIcons();
     bool loadGameIcon();
     bool loadSteamGameLogo(unsigned int appId);
+    bool loadImageFile(const std::filesystem::path& path, int maximumWidth,
+                       int maximumHeight, IconImage& destination) const;
+    void loadScreenshots();
     void blendIcon(std::uint32_t* destination, int destinationWidth,
                    const IconImage& icon, int centerX, int centerY, BYTE opacity) const;
     void drawVolumeSlider(std::uint32_t* destination, int destinationWidth) const;
@@ -73,7 +77,8 @@ private:
     bool shown_ = false;
     bool systemBackdrop_ = false;
     int selectedItem_ = 0;
-    enum class Screen { MainBar, Volume, Achievements, Settings, Confirmation } screen_ = Screen::MainBar;
+    enum class Screen { MainBar, Volume, Achievements, Screenshots, ScreenshotViewer,
+                        Settings, Confirmation } screen_ = Screen::MainBar;
     int achievementSelection_ = 0;
     enum class AchievementFilter { All, Locked, Unlocked } achievementFilter_ = AchievementFilter::All;
     bool revealHiddenAchievements_ = false;
@@ -98,10 +103,14 @@ private:
     int frameWidth_ = 0;
     int frameHeight_ = 480;
     std::vector<std::uint32_t> blurredBackground_;
-    IconImage icons_[3];
+    IconImage icons_[4];
     IconImage buttonIcons_[3];
     IconImage gameIcon_;
     unsigned int loadedGameLogoAppId_ = 0;
     int displayedClockMinute_ = -1;
+    std::vector<std::filesystem::path> screenshotPaths_;
+    std::vector<IconImage> screenshotThumbnails_;
+    IconImage screenshotViewerImage_;
+    int screenshotSelection_ = 0;
     static OverlayWindow* activeInstance_;
 };
