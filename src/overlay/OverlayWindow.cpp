@@ -2,6 +2,7 @@
 
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <windowsx.h>
 #include <wincodec.h>
 #include <mmdeviceapi.h>
@@ -48,6 +49,25 @@ constexpr int kAchievementCardHalfWidth = 450;
 constexpr int kAchievementListTop = 92;
 constexpr int kAchievementRowHeight = 112;
 constexpr int kAchievementCardHeight = 104;
+
+bool isExplorerRunning() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsicmp(entry.szExeFile, L"explorer.exe") == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return found;
+}
 
 struct WindowSearch {
     DWORD pid;
@@ -434,10 +454,14 @@ void OverlayWindow::applyVisualStyle() {
     using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttributeData*);
     const auto setComposition = reinterpret_cast<SetWindowCompositionAttributeFn>(
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
-    AccentPolicy accent{AccentState::BlurBehind, 0, 0x101C1818u, 0};
+    const bool explorerRunning = isExplorerRunning();
+    AccentPolicy accent{explorerRunning ? AccentState::BlurBehind : AccentState::Disabled,
+                        0, 0x101C1818u, 0};
     WindowCompositionAttributeData accentData{kWindowCompositionAttributeAccentPolicy,
                                                &accent, sizeof(accent)};
-    systemBackdrop_ = setComposition && setComposition(window_, &accentData) != FALSE;
+    const bool compositionApplied = setComposition &&
+                                    setComposition(window_, &accentData) != FALSE;
+    systemBackdrop_ = explorerRunning && compositionApplied;
     liveCaptureSupported_ = false;
 }
 
@@ -2097,6 +2121,7 @@ std::vector<std::uint32_t> OverlayWindow::captureLiveBlurFrame() const {
 
 void OverlayWindow::renderAndPresent() {
     if (!framePixels_ || blurredBackground_.empty() || frameWidth_ <= 0) return;
+    const bool useOpaqueShellFallback = !isExplorerRunning();
     if (achievementState_) {
         const LONG sharedAppId = InterlockedCompareExchange(&achievementState_->appId, 0, 0);
         if (sharedAppId > 0 && loadedGameLogoAppId_ != static_cast<unsigned int>(sharedAppId)) {
@@ -2145,9 +2170,12 @@ void OverlayWindow::renderAndPresent() {
             // Sem backdrop global e sem reutilizar uma captura congelada: os painéis
             // são apenas tonalizados e o jogo real permanece visível por transparência.
             const auto source = 0u;
-            const double blueTinted = (source & 0xff) * sourceWeight + kPanelBlue * tintWeight;
-            const double greenTinted = ((source >> 8) & 0xff) * sourceWeight + kPanelGreen * tintWeight;
-            const double redTinted = ((source >> 16) & 0xff) * sourceWeight + kPanelRed * tintWeight;
+            const BYTE barBlue = useOpaqueShellFallback ? 0 : kPanelBlue;
+            const BYTE barGreen = useOpaqueShellFallback ? 0 : kPanelGreen;
+            const BYTE barRed = useOpaqueShellFallback ? 0 : kPanelRed;
+            const double blueTinted = (source & 0xff) * sourceWeight + barBlue * tintWeight;
+            const double greenTinted = ((source >> 8) & 0xff) * sourceWeight + barGreen * tintWeight;
+            const double redTinted = ((source >> 16) & 0xff) * sourceWeight + barRed * tintWeight;
             const BYTE blue = static_cast<BYTE>(blueTinted * alpha / 255.0);
             const BYTE green = static_cast<BYTE>(greenTinted * alpha / 255.0);
             const BYTE red = static_cast<BYTE>(redTinted * alpha / 255.0);
@@ -2159,17 +2187,22 @@ void OverlayWindow::renderAndPresent() {
             if (screen_ != Screen::MainBar &&
                 roundedRectangleCoverage(x, y, panelLeft, panelTop, panelRight,
                                          panelBottom, panelRadius) > 0.0f) {
-                const BYTE panelAlpha = screen_ == Screen::ScreenshotViewer ? 255 : 244;
-                const double panelSourceWeight = screen_ == Screen::ScreenshotViewer ? 0.22 : 0.52;
+                const BYTE panelAlpha = useOpaqueShellFallback || screen_ == Screen::ScreenshotViewer
+                    ? 255 : 244;
+                const double panelSourceWeight = useOpaqueShellFallback ? 0.0 :
+                    (screen_ == Screen::ScreenshotViewer ? 0.22 : 0.52);
                 const float coverage = roundedRectangleCoverage(
                     x, y, panelLeft, panelTop, panelRight, panelBottom, panelRadius);
                 const BYTE coveredAlpha = static_cast<BYTE>(panelAlpha * coverage);
+                const BYTE panelBlueBase = useOpaqueShellFallback ? 0x23 : kPanelBlue;
+                const BYTE panelGreenBase = useOpaqueShellFallback ? 0x1f : kPanelGreen;
+                const BYTE panelRedBase = useOpaqueShellFallback ? 0x1b : kPanelRed;
                 const BYTE panelBlue = static_cast<BYTE>(((source & 0xff) * panelSourceWeight +
-                    kPanelBlue * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
+                    panelBlueBase * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
                 const BYTE panelGreen = static_cast<BYTE>((((source >> 8) & 0xff) * panelSourceWeight +
-                    kPanelGreen * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
+                    panelGreenBase * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
                 const BYTE panelRed = static_cast<BYTE>((((source >> 16) & 0xff) * panelSourceWeight +
-                    kPanelRed * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
+                    panelRedBase * (1.0 - panelSourceWeight)) * coveredAlpha / 255.0);
                 output[index] = (static_cast<std::uint32_t>(coveredAlpha) << 24) |
                     (static_cast<std::uint32_t>(panelRed) << 16) |
                     (static_cast<std::uint32_t>(panelGreen) << 8) | panelBlue;
