@@ -107,6 +107,8 @@ private:
     IAudioEndpointVolume* endpointVolume_ = nullptr;
     float volumeLevel_ = 0.0f;
     bool draggingVolume_ = false;
+    bool mouseCursorActivated_ = false;
+    POINT cursorPositionAtOpen_{};
     bool closingGame_ = false;
     unsigned int exitGameAppId_ = 0;
     WORD previousControllerButtons_[XUSER_MAX_COUNT]{};

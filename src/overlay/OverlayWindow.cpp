@@ -510,6 +510,9 @@ void OverlayWindow::syncVisibilityWithGame() {
     shown_ = shouldShow;
     setGameInputBlocked(shown_);
     if (shown_) {
+        mouseCursorActivated_ = false;
+        GetCursorPos(&cursorPositionAtOpen_);
+        SetCursor(nullptr);
         centerOnGameMonitor();
         // Recrie o backdrop para o DWM nao reutilizar a ultima superficie oculta.
         applyVisualStyle();
@@ -1043,8 +1046,8 @@ void OverlayWindow::draw(HDC dc) const {
                             width / 2 - 10 + index * 220, menuOffset() + 154};
                 COLORREF buttonColor{};
                 if (index == 1) {
-                    buttonColor = index == confirmationSelection_ ? RGB(145, 91, 94)
-                                                                   : RGB(92, 63, 67);
+                    buttonColor = index == confirmationSelection_ ? RGB(205, 55, 62)
+                                                                   : RGB(135, 38, 44);
                 } else {
                     buttonColor = index == confirmationSelection_ ? RGB(115, 118, 127)
                                                                    : RGB(65, 68, 76);
@@ -2017,6 +2020,12 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
     }
 
     switch (message) {
+    case WM_SETCURSOR:
+        if (self && self->shown_ && !self->mouseCursorActivated_) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
     case WM_NCHITTEST: {
         if (!self) return HTCLIENT;
         if (self->startupCoverActive_) return HTTRANSPARENT;
@@ -2192,6 +2201,15 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         }
         return 0;
     case WM_MOUSEMOVE:
+        if (self && self->shown_ && !self->mouseCursorActivated_) {
+            POINT current{};
+            GetCursorPos(&current);
+            if (std::abs(current.x - self->cursorPositionAtOpen_.x) > 1 ||
+                std::abs(current.y - self->cursorPositionAtOpen_.y) > 1) {
+                self->mouseCursorActivated_ = true;
+                SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+            }
+        }
         if (self && self->draggingVolume_) self->setVolumeFromMouse(GET_X_LPARAM(lParam));
         return 0;
     case WM_LBUTTONUP:
