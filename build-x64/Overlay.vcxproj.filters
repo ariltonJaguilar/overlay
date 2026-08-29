@@ -7,9 +7,15 @@
     <ClCompile Include="E:\Desktop\overlay\src\overlay\OverlayWindow.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="E:\Desktop\overlay\src\overlay\WandIntegration.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="E:\Desktop\overlay\src\overlay\OverlayWindow.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="E:\Desktop\overlay\src\overlay\WandIntegration.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

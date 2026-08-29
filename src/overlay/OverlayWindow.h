@@ -7,6 +7,7 @@
 
 #include "InputShared.h"
 #include "AchievementShared.h"
+#include "WandIntegration.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -47,6 +48,10 @@ private:
     void adjustVolume(int direction);
     void setVolumeFromMouse(int x);
     void executeSettingsAction();
+    void openModsPage();
+    void beginWandLoad();
+    void adjustSelectedMod(int direction);
+    std::wstring currentGameName() const;
     void prepareForGameExit();
     void draw(HDC dc) const;
     bool captureAndBlurBackground();
@@ -97,13 +102,23 @@ private:
     std::future<std::vector<std::uint32_t>> liveBlurFuture_;
     int selectedItem_ = 0;
     enum class Screen { MainBar, Volume, Achievements, Screenshots, ScreenshotViewer,
-                        Settings, Confirmation } screen_ = Screen::MainBar;
+                        Mods, WandStartConfirmation, Settings, Confirmation } screen_ = Screen::MainBar;
     int achievementSelection_ = 0;
     enum class AchievementFilter { All, Locked, Unlocked } achievementFilter_ = AchievementFilter::All;
     bool revealHiddenAchievements_ = false;
     LONG achievementGeneration_ = -1;
     int settingsSelection_ = 0;
     int confirmationSelection_ = 0;
+    int modSelection_ = 0;
+    int wandConfirmationSelection_ = 0;
+    bool wandOperationInFlight_ = false;
+    bool wandTrainerActive_ = false;
+    ULONGLONG nextWandTrainerCheck_ = 0;
+    bool wandRetainModsOnError_ = false;
+    std::future<WandLoadResult> wandFuture_;
+    std::vector<WandMod> wandMods_;
+    std::wstring wandStatus_;
+    std::wstring wandGameName_;
     IAudioEndpointVolume* endpointVolume_ = nullptr;
     float volumeLevel_ = 0.0f;
     bool draggingVolume_ = false;
@@ -123,7 +138,7 @@ private:
     int frameWidth_ = 0;
     int frameHeight_ = 480;
     std::vector<std::uint32_t> blurredBackground_;
-    IconImage icons_[4];
+    IconImage icons_[5];
     IconImage buttonIcons_[3];
     IconImage gameIcon_;
     unsigned int loadedGameLogoAppId_ = 0;

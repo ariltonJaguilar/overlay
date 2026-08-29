@@ -20,6 +20,12 @@ target_link_libraries(OverlayInputHook PRIVATE minhook)
 target_compile_definitions(OverlayInputHook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_executable(WandDiagnostic src/wand_diagnostic/main.cpp)
+    target_link_libraries(WandDiagnostic PRIVATE iphlpapi ws2_32 ole32 oleaut32 uiautomationcore advapi32)
+    target_compile_definitions(WandDiagnostic PRIVATE UNICODE _UNICODE NOMINMAX)
+    add_executable(WandControlProbe src/wand_control_probe/main.cpp)
+    target_link_libraries(WandControlProbe PRIVATE ole32 oleaut32 uiautomationcore)
+    target_compile_definitions(WandControlProbe PRIVATE UNICODE _UNICODE NOMINMAX)
     add_executable(GameOverlayManager WIN32
         src/manager/main.cpp
         src/manager/SteamDiscovery.cpp
@@ -35,9 +41,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         src/overlay/main.cpp
         src/overlay/OverlayWindow.cpp
         src/overlay/OverlayWindow.h
+        src/overlay/WandIntegration.cpp
+        src/overlay/WandIntegration.h
     )
     target_include_directories(Overlay PRIVATE src/common)
-    target_link_libraries(Overlay PRIVATE shell32 dwmapi xinput9_1_0 gameinput msimg32 windowscodecs ole32 PowrProf Advapi32)
+    target_link_libraries(Overlay PRIVATE shell32 dwmapi xinput9_1_0 gameinput msimg32 windowscodecs ole32 oleaut32 uiautomationcore iphlpapi ws2_32 PowrProf Advapi32)
     add_custom_command(TARGET Overlay POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/icons" "$<TARGET_FILE_DIR:Overlay>/assets/icons"
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/buttons" "$<TARGET_FILE_DIR:Overlay>/assets/buttons"
@@ -47,8 +55,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     )
     target_compile_definitions(GameOverlayManager PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(MSVC)
+        target_compile_options(WandDiagnostic PRIVATE /W4 /permissive- /utf-8)
+        target_compile_options(WandControlProbe PRIVATE /W4 /permissive- /utf-8)
         target_compile_options(GameOverlayManager PRIVATE /W4 /permissive- /utf-8)
-        target_compile_options(Overlay PRIVATE /W4 /permissive-)
+        target_compile_options(Overlay PRIVATE /W4 /permissive- /utf-8)
     endif()
 else()
     set_target_properties(OverlayInputHook PROPERTIES OUTPUT_NAME OverlayInputHook32)

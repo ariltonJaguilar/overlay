@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <regex>
 #include <string>
 #include <cwctype>
 
@@ -123,6 +125,27 @@ bool focusSteamBigPicture() {
     return focused;
 }
 
+bool focusWindow(HWND target) {
+    if (!target || !IsWindow(target)) return false;
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == target) return true;
+    const DWORD currentThread = GetCurrentThreadId();
+    const DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD targetThread = GetWindowThreadProcessId(target, nullptr);
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(currentThread, foregroundThread, TRUE);
+    if (targetThread && targetThread != currentThread && targetThread != foregroundThread)
+        AttachThreadInput(currentThread, targetThread, TRUE);
+    BringWindowToTop(target);
+    const bool focused = SetForegroundWindow(target) != FALSE;
+    if (targetThread && targetThread != currentThread && targetThread != foregroundThread)
+        AttachThreadInput(currentThread, targetThread, FALSE);
+    if (foregroundThread && foregroundThread != currentThread)
+        AttachThreadInput(currentThread, foregroundThread, FALSE);
+    return focused;
+}
+
 void openSteamLibraryGame(unsigned int appId) {
     ShellExecuteW(nullptr, L"open", L"steam://open/bigpicture", nullptr, nullptr, SW_SHOWNORMAL);
     if (!appId) return;
@@ -179,6 +202,20 @@ void drawScreenshotIcon(HDC dc, int x, int y, COLORREF color) {
     MoveToEx(dc, x - 17, y - 18, nullptr); LineTo(dc, x - 10, y - 26);
     LineTo(dc, x + 5, y - 26); LineTo(dc, x + 12, y - 18);
     SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
+}
+
+void drawModsIcon(HDC dc, int x, int y, COLORREF color) {
+    HPEN pen = CreatePen(PS_SOLID, 3, color);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    for (int offset : {-14, 0, 14}) {
+        MoveToEx(dc, x - 25, y + offset, nullptr); LineTo(dc, x + 25, y + offset);
+    }
+    HBRUSH brush = CreateSolidBrush(color);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    Ellipse(dc, x - 13, y - 20, x - 3, y - 10);
+    Ellipse(dc, x + 7, y - 5, x + 17, y + 5);
+    Ellipse(dc, x - 7, y + 9, x + 3, y + 19);
+    SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(brush); DeleteObject(pen);
 }
 
 void boxBlur(std::vector<std::uint32_t>& pixels, int width, int height, int radius) {
@@ -504,7 +541,8 @@ void OverlayWindow::syncVisibilityWithGame() {
         GetWindowThreadProcessId(foregroundWindow, &foregroundPid);
     }
 
-    const bool shouldShow = enabled_ && (foregroundPid == gamePid_ || foregroundWindow == window_);
+    const bool shouldShow = enabled_ && (foregroundPid == gamePid_ || foregroundWindow == window_ ||
+                                         (shown_ && wandOperationInFlight_));
     if (shouldShow == shown_) return;
 
     shown_ = shouldShow;
@@ -589,12 +627,20 @@ LRESULT CALLBACK OverlayWindow::keyboardHookProc(int code, WPARAM wParam, LPARAM
 }
 
 void OverlayWindow::moveSelection(int direction) {
+    if (screen_ == Screen::Mods && !wandOperationInFlight_) wandStatus_.clear();
     if (screen_ == Screen::Volume) {
         adjustVolume(direction);
         return;
     }
     if (screen_ == Screen::Settings) {
-        settingsSelection_ = (settingsSelection_ + direction + 3) % 3;
+        settingsSelection_ = (settingsSelection_ + direction + 4) % 4;
+        renderAndPresent();
+        return;
+    }
+    if (screen_ == Screen::Mods) {
+        if (!wandMods_.empty() && !wandOperationInFlight_)
+            modSelection_ = std::clamp(modSelection_ + direction, 0,
+                                       static_cast<int>(wandMods_.size()) - 1);
         renderAndPresent();
         return;
     }
@@ -609,13 +655,18 @@ void OverlayWindow::moveSelection(int direction) {
         renderAndPresent();
         return;
     }
+    if (screen_ == Screen::WandStartConfirmation) {
+        wandConfirmationSelection_ = (wandConfirmationSelection_ + direction + 2) % 2;
+        renderAndPresent();
+        return;
+    }
     if (screen_ == Screen::Screenshots) {
         const int count = static_cast<int>(screenshotPaths_.size());
         if (count > 0) screenshotSelection_ = std::clamp(screenshotSelection_ + direction, 0, count - 1);
         renderAndPresent();
         return;
     }
-    selectedItem_ = (selectedItem_ + direction + 4) % 4;
+    selectedItem_ = (selectedItem_ + direction + 5) % 5;
     renderAndPresent();
 }
 
@@ -648,10 +699,42 @@ void OverlayWindow::activateSelection() {
         return;
     }
     if (screen_ == Screen::MainBar && selectedItem_ == 3) {
+        openModsPage();
+        return;
+    }
+    if (screen_ == Screen::MainBar && selectedItem_ == 4) {
         settingsSelection_ = 0;
         screen_ = Screen::Settings;
         renderAndPresent();
         return;
+    }
+    if (screen_ == Screen::Mods && !wandOperationInFlight_ && !wandMods_.empty()) {
+        if (wandMods_[static_cast<size_t>(modSelection_)].kind != WandMod::Kind::Switch) {
+            adjustSelectedMod(1); return;
+        }
+        const std::wstring name = wandMods_[static_cast<size_t>(modSelection_)].name;
+        wandOperationInFlight_ = true;
+        wandRetainModsOnError_ = true;
+        wandStatus_ = L"Aplicando " + name + L"...";
+        wandFuture_ = std::async(std::launch::async, [name, game = wandGameName_, pid = gamePid_] {
+            bool enabled = false; std::wstring error;
+            if (!WandIntegration::toggle(name, enabled, error)) return WandLoadResult{false, error, {}};
+            return WandIntegration::selectGameAndLoad(game, pid);
+        });
+        renderAndPresent(); return;
+    }
+    if (screen_ == Screen::WandStartConfirmation) {
+        if (wandConfirmationSelection_ == 0) {
+            screen_ = Screen::MainBar;
+        } else {
+            std::wstring error;
+            if (!WandIntegration::startHidden(error)) {
+                screen_ = Screen::Mods; wandStatus_ = error; wandMods_.clear();
+            } else {
+                beginWandLoad();
+            }
+        }
+        renderAndPresent(); return;
     }
     if (screen_ == Screen::Screenshots && !screenshotPaths_.empty()) {
         screenshotViewerImage_ = {};
@@ -694,6 +777,26 @@ void OverlayWindow::activateSelection() {
     MessageBeep(MB_OK);
 }
 
+void OverlayWindow::adjustSelectedMod(int direction) {
+    if (screen_ != Screen::Mods || wandOperationInFlight_ || wandMods_.empty()) return;
+    const WandMod selected = wandMods_[static_cast<size_t>(modSelection_)];
+    if (selected.kind == WandMod::Kind::Switch) return;
+    const double requested = std::clamp(selected.value + selected.step * direction,
+                                        selected.minimum, selected.maximum);
+    if (requested == selected.value) return;
+    wandOperationInFlight_ = true;
+    wandRetainModsOnError_ = true;
+    wandStatus_ = L"Ajustando " + selected.name + L"...";
+    wandFuture_ = std::async(std::launch::async,
+        [name = selected.name, requested, game = wandGameName_, pid = gamePid_] {
+            double actual = 0; std::wstring error;
+            if (!WandIntegration::setValue(name, requested, actual, error))
+                return WandLoadResult{false, error, {}};
+            return WandIntegration::selectGameAndLoad(game, pid);
+        });
+    renderAndPresent();
+}
+
 void OverlayWindow::goBack() {
     if (screen_ == Screen::ScreenshotViewer) {
         screenshotViewerImage_ = {};
@@ -701,9 +804,11 @@ void OverlayWindow::goBack() {
         renderAndPresent();
     } else if (screen_ == Screen::Confirmation) {
         screen_ = Screen::Settings;
+    } else if (screen_ == Screen::WandStartConfirmation) {
+        screen_ = Screen::MainBar;
         renderAndPresent();
     } else if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
-               screen_ == Screen::Screenshots ||
+               screen_ == Screen::Screenshots || screen_ == Screen::Mods ||
                screen_ == Screen::Settings) {
         draggingVolume_ = false;
         screen_ = Screen::MainBar;
@@ -713,10 +818,89 @@ void OverlayWindow::goBack() {
     }
 }
 
+std::wstring OverlayWindow::currentGameName() const {
+    if (loadedGameLogoAppId_) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, gamePid_);
+        if (process) {
+            wchar_t executable[32768]{}; DWORD length = static_cast<DWORD>(std::size(executable));
+            if (QueryFullProcessImageNameW(process, 0, executable, &length)) {
+                auto directory = std::filesystem::path(std::wstring(executable, length)).parent_path();
+                while (!directory.empty()) {
+                    std::wstring leaf = directory.filename().wstring();
+                    std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+                    if (leaf == L"steamapps") {
+                        const auto manifest = directory /
+                            (L"appmanifest_" + std::to_wstring(loadedGameLogoAppId_) + L".acf");
+                        std::ifstream input(manifest, std::ios::binary);
+                        const std::string bytes((std::istreambuf_iterator<char>(input)),
+                                                std::istreambuf_iterator<char>());
+                        std::smatch match;
+                        if (std::regex_search(bytes, match,
+                            std::regex("\\\"name\\\"\\s+\\\"([^\\\"]+)\\\"", std::regex::icase))) {
+                            const std::string value = match[1].str();
+                            const int count = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                                                  static_cast<int>(value.size()), nullptr, 0);
+                            if (count > 0) {
+                                std::wstring name(static_cast<size_t>(count), L'\0');
+                                MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                                                    name.data(), count);
+                                CloseHandle(process); return name;
+                            }
+                        }
+                        break;
+                    }
+                    const auto parent = directory.parent_path();
+                    if (parent == directory) break;
+                    directory = parent;
+                }
+            }
+            CloseHandle(process);
+        }
+    }
+    WindowSearch search{gamePid_, nullptr};
+    EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&search));
+    if (search.result) {
+        wchar_t title[1024]{};
+        GetWindowTextW(search.result, title, static_cast<int>(std::size(title)));
+        if (title[0]) return title;
+    }
+    return {};
+}
+
+void OverlayWindow::openModsPage() {
+    modSelection_ = 0; wandMods_.clear(); wandStatus_.clear();
+    if (!WandIntegration::isRunning()) {
+        wandConfirmationSelection_ = 0;
+        screen_ = Screen::WandStartConfirmation;
+        renderAndPresent();
+        return;
+    }
+    beginWandLoad();
+}
+
+void OverlayWindow::beginWandLoad() {
+    screen_ = Screen::Mods;
+    wandGameName_ = currentGameName();
+    wandStatus_ = L"Carregando mods";
+    wandOperationInFlight_ = true;
+    wandRetainModsOnError_ = false;
+    wandFuture_ = std::async(std::launch::async, [game = wandGameName_, pid = gamePid_] {
+        WandLoadResult result;
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            result = WandIntegration::selectGameAndLoad(game, pid);
+            if (result.success) return result;
+            Sleep(250);
+        }
+        return result;
+    });
+    renderAndPresent();
+}
+
 void OverlayWindow::executeSettingsAction() {
     if (settingsSelection_ == 0) {
         SetSuspendState(FALSE, FALSE, FALSE);
-    } else if (settingsSelection_ == 1) {
+    } else if (settingsSelection_ == 1 || settingsSelection_ == 2) {
         HANDLE token = nullptr;
         TOKEN_PRIVILEGES privileges{};
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
@@ -725,7 +909,8 @@ void OverlayWindow::executeSettingsAction() {
             privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
             CloseHandle(token);
-            ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG,
+            const UINT action = settingsSelection_ == 1 ? EWX_REBOOT : EWX_POWEROFF;
+            ExitWindowsEx(action | EWX_FORCE,
                           SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_FLAG_PLANNED);
         }
     } else {
@@ -857,7 +1042,7 @@ void OverlayWindow::pollController() {
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || thumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 4;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || thumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || thumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
-        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements || screen_ == Screen::Mods) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || thumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || thumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -867,6 +1052,8 @@ void OverlayWindow::pollController() {
                      thumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         }
         navigate(direction);
+        if (screen_ == Screen::Mods && (pressed & XINPUT_GAMEPAD_DPAD_LEFT)) adjustSelectedMod(-1);
+        if (screen_ == Screen::Mods && (pressed & XINPUT_GAMEPAD_DPAD_RIGHT)) adjustSelectedMod(1);
         if (pressed & XINPUT_GAMEPAD_A) activateSelection();
         if (pressed & XINPUT_GAMEPAD_Y) cycleAchievementFilter();
         if (pressed & XINPUT_GAMEPAD_X) toggleHiddenAchievementDetails();
@@ -890,7 +1077,7 @@ void OverlayWindow::pollController() {
                     else if ((buttons & GameInputGamepadDPadDown) || state.leftThumbstickY < -0.35f) direction = 4;
                     else if ((buttons & GameInputGamepadDPadLeft) || state.leftThumbstickX < -0.35f) direction = -1;
                     else if ((buttons & GameInputGamepadDPadRight) || state.leftThumbstickX > 0.35f) direction = 1;
-                } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+                } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements || screen_ == Screen::Mods) {
                     if ((buttons & GameInputGamepadDPadUp) || state.leftThumbstickY > 0.35f) direction = -1;
                     else if ((buttons & GameInputGamepadDPadDown) || state.leftThumbstickY < -0.35f) direction = 1;
                 } else {
@@ -900,6 +1087,8 @@ void OverlayWindow::pollController() {
                              state.leftThumbstickX > 0.35f) direction = 1;
                 }
                 navigate(direction);
+                if (screen_ == Screen::Mods && (pressed & GameInputGamepadDPadLeft)) adjustSelectedMod(-1);
+                if (screen_ == Screen::Mods && (pressed & GameInputGamepadDPadRight)) adjustSelectedMod(1);
                 if (pressed & GameInputGamepadA) activateSelection();
                 if (pressed & GameInputGamepadY) cycleAchievementFilter();
                 if (pressed & GameInputGamepadX) toggleHiddenAchievementDetails();
@@ -927,7 +1116,7 @@ void OverlayWindow::pollController() {
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 4;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
-        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements) {
+        } else if (screen_ == Screen::Settings || screen_ == Screen::Achievements || screen_ == Screen::Mods) {
             if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = -1;
             else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) direction = 1;
         } else {
@@ -938,6 +1127,8 @@ void OverlayWindow::pollController() {
         }
 
         navigate(direction);
+        if (screen_ == Screen::Mods && (pressed & XINPUT_GAMEPAD_DPAD_LEFT)) adjustSelectedMod(-1);
+        if (screen_ == Screen::Mods && (pressed & XINPUT_GAMEPAD_DPAD_RIGHT)) adjustSelectedMod(1);
 
         if (pressed & XINPUT_GAMEPAD_A) activateSelection();
         if (pressed & XINPUT_GAMEPAD_Y) cycleAchievementFilter();
@@ -956,7 +1147,7 @@ void OverlayWindow::draw(HDC dc) const {
     GetClientRect(window_, &client);
     const int width = client.right - client.left;
     SetBkMode(dc, TRANSPARENT);
-    if (screen_ == Screen::Volume || screen_ == Screen::Achievements ||
+    if (screen_ == Screen::Volume || screen_ == Screen::Achievements || screen_ == Screen::Mods ||
         screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer ||
         screen_ == Screen::Settings) {
         HFONT titleFont = CreateFontW(44, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -989,13 +1180,129 @@ void OverlayWindow::draw(HDC dc) const {
         } else if (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) {
             title = screen_ == Screen::Screenshots ? L"Galeria" : L"SCREENSHOT";
             titleRect = RECT{0, 27, width, 76};
+        } else if (screen_ == Screen::Mods) {
+            title = L"Mods";
+            titleRect = RECT{0, 27, width, 76};
         } else {
             title = L"Configura\u00e7\u00f5" L"es";
-            titleRect = RECT{0, menuOffset() - 23, width, menuOffset() + 22};
+            titleRect = RECT{0, menuOffset() - 73, width, menuOffset() - 28};
         }
         DrawTextW(dc, title, -1, &titleRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         SelectObject(dc, oldTitleFont);
         DeleteObject(titleFont);
+    }
+    if (screen_ == Screen::Mods) {
+        HFONT statusFont = CreateFontW(19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ previousStatusFont = SelectObject(dc, statusFont);
+        SetTextColor(dc, wandTrainerActive_ ? RGB(105, 225, 135) : RGB(168, 171, 180));
+        RECT trainerState{width / 2 + 285, 34, width / 2 + 430, 69};
+        DrawTextW(dc, wandTrainerActive_ ? L"●  ATIVO" : L"○  INATIVO", -1, &trainerState,
+                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, previousStatusFont); DeleteObject(statusFont);
+
+        HFONT font = CreateFontW(27, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        const int visibleCount = (std::max)(1, (barTop() - (wandStatus_.empty() ? 105 : 160)) / 52);
+        const int first = std::clamp(modSelection_ - visibleCount / 2, 0,
+                                     (std::max)(0, static_cast<int>(wandMods_.size()) - visibleCount));
+        if (wandMods_.empty()) {
+            SetTextColor(dc, RGB(205, 207, 214));
+            RECT message{width / 2 - 430, 120, width / 2 + 430, 210};
+            DrawTextW(dc, wandStatus_.empty() ? L"Nenhum mod encontrado" : wandStatus_.c_str(), -1,
+                      &message, DT_CENTER | DT_WORDBREAK | DT_VCENTER);
+        } else {
+            for (int slot = 0; slot < visibleCount && first + slot < static_cast<int>(wandMods_.size()); ++slot) {
+                const int index = first + slot;
+                RECT row{width / 2 - 430, 92 + slot * 52, width / 2 + 430, 138 + slot * 52};
+                if (index == modSelection_) {
+                    HBRUSH selected = CreateSolidBrush(RGB(70, 72, 80));
+                    HGDIOBJ oldBrush = SelectObject(dc, selected);
+                    fillRoundedRectangleCorners(dc, row, 8, 8, 8, 8);
+                    SelectObject(dc, oldBrush); DeleteObject(selected);
+                }
+                SetTextColor(dc, RGB(245, 246, 250));
+                const auto& mod = wandMods_[static_cast<size_t>(index)];
+                RECT nameRect{row.left + 20, row.top,
+                              row.right - (mod.kind == WandMod::Kind::Switch ? 130 : 300), row.bottom};
+                DrawTextW(dc, wandMods_[static_cast<size_t>(index)].name.c_str(), -1, &nameRect,
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                if (mod.kind == WandMod::Kind::Switch) {
+                    SetTextColor(dc, mod.enabled ? RGB(105, 225, 135) : RGB(178, 180, 187));
+                    RECT stateRect{row.right - 110, row.top, row.right - 20, row.bottom};
+                    DrawTextW(dc, mod.enabled ? L"ON" : L"OFF", -1, &stateRect,
+                              DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                } else {
+                    wchar_t valueText[64]{};
+                    if (mod.kind == WandMod::Kind::Integer) {
+                        swprintf_s(valueText, L"%.0f", mod.value);
+                        SetTextColor(dc, RGB(225, 227, 233));
+                        RECT stepperRect{row.right - 260, row.top, row.right - 20, row.bottom};
+                        std::wstring stepper = L"‹   " + std::wstring(valueText) + L"   ›";
+                        DrawTextW(dc, stepper.c_str(), -1, &stepperRect,
+                                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                    } else {
+                        swprintf_s(valueText, L"%.2f", mod.value);
+                        const int sliderLeft = row.right - 270, sliderRight = row.right - 95;
+                        const int sliderCenter = (row.top + row.bottom) / 2;
+                        HPEN track = CreatePen(PS_SOLID, 5, RGB(105, 108, 117));
+                        HGDIOBJ oldPen = SelectObject(dc, track);
+                        MoveToEx(dc, sliderLeft, sliderCenter, nullptr); LineTo(dc, sliderRight, sliderCenter);
+                        const double ratio = mod.maximum > mod.minimum ?
+                            (mod.value - mod.minimum) / (mod.maximum - mod.minimum) : 0;
+                        const int thumb = sliderLeft + static_cast<int>((sliderRight - sliderLeft) * std::clamp(ratio, 0.0, 1.0));
+                        HBRUSH thumbBrush = CreateSolidBrush(RGB(238, 239, 244));
+                        HGDIOBJ oldBrush = SelectObject(dc, thumbBrush);
+                        SelectObject(dc, GetStockObject(NULL_PEN));
+                        Ellipse(dc, thumb - 7, sliderCenter - 7, thumb + 7, sliderCenter + 7);
+                        SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+                        DeleteObject(thumbBrush); DeleteObject(track);
+                        SetTextColor(dc, RGB(225, 227, 233));
+                        RECT valueRect{row.right - 85, row.top, row.right - 18, row.bottom};
+                        DrawTextW(dc, valueText, -1, &valueRect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                    }
+                }
+            }
+        }
+        if (!wandMods_.empty() && !wandStatus_.empty()) {
+            SetTextColor(dc, wandOperationInFlight_ ? RGB(190, 193, 202) : RGB(238, 145, 151));
+            HFONT noticeFont = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                           ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HGDIOBJ previousFont = SelectObject(dc, noticeFont);
+            RECT notice{width / 2 - 420, barTop() - 55, width / 2 + 420, barTop() - 14};
+            DrawTextW(dc, wandStatus_.c_str(), -1, &notice,
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            SelectObject(dc, previousFont); DeleteObject(noticeFont);
+        }
+        SelectObject(dc, oldFont); DeleteObject(font);
+    }
+    if (screen_ == Screen::WandStartConfirmation) {
+        HFONT font = CreateFontW(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetTextColor(dc, RGB(245, 246, 250));
+        RECT question{width / 2 - 205, menuOffset() + 37, width / 2 + 205, menuOffset() + 91};
+        DrawTextW(dc, L"Iniciar o Wand?", -1, &question,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        const wchar_t* labels[] = {L"Cancelar", L"Iniciar Wand"};
+        for (int index = 0; index < 2; ++index) {
+            RECT button{width / 2 - 210 + index * 220, menuOffset() + 108,
+                        width / 2 - 10 + index * 220, menuOffset() + 154};
+            HBRUSH brush = CreateSolidBrush(index == wandConfirmationSelection_ ?
+                                             (index ? RGB(52, 132, 235) : RGB(115, 118, 127)) :
+                                             (index ? RGB(31, 82, 158) : RGB(65, 68, 76)));
+            HGDIOBJ oldBrush = SelectObject(dc, brush);
+            if (index == 0) fillRoundedRectangleCorners(dc, button, 7, 7, 7, 23);
+            else fillRoundedRectangleCorners(dc, button, 7, 7, 23, 7);
+            SelectObject(dc, oldBrush); DeleteObject(brush);
+            DrawTextW(dc, labels[index], -1, &button, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+        SelectObject(dc, oldFont); DeleteObject(font);
     }
     if (screen_ == Screen::Screenshots && screenshotPaths_.empty()) {
         HFONT font = CreateFontW(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -1018,15 +1325,15 @@ void OverlayWindow::draw(HDC dc) const {
         SetTextColor(dc, RGB(245, 246, 250));
 
         if (screen_ == Screen::Settings) {
-            const wchar_t* labels[] = {L"Suspender", L"Desligar", L"Fechar jogo"};
-            for (int index = 0; index < 3; ++index) {
-                RECT row{width / 2 - 245, menuOffset() + 31 + index * 50,
-                         width / 2 + 245, menuOffset() + 73 + index * 50};
+            const wchar_t* labels[] = {L"Suspender", L"Reiniciar", L"Desligar", L"Fechar jogo"};
+            for (int index = 0; index < 4; ++index) {
+                RECT row{width / 2 - 245, menuOffset() - 19 + index * 50,
+                         width / 2 + 245, menuOffset() + 23 + index * 50};
                 if (index == settingsSelection_) {
                     HBRUSH selected = CreateSolidBrush(RGB(92, 95, 104));
                     SelectObject(dc, selected);
                     if (index == 0) fillRoundedRectangleCorners(dc, row, 7, 7, 7, 7);
-                    else if (index == 2) fillRoundedRectangleCorners(dc, row, 7, 7, 23, 23);
+                    else if (index == 3) fillRoundedRectangleCorners(dc, row, 7, 7, 23, 23);
                     else fillRoundedRectangleCorners(dc, row, 7, 7, 7, 7);
                     SelectObject(dc, oldBrush);
                     DeleteObject(selected);
@@ -1034,8 +1341,8 @@ void OverlayWindow::draw(HDC dc) const {
                 DrawTextW(dc, labels[index], -1, &row, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
         } else {
-            const wchar_t* actions[] = {L"Suspender o computador?", L"Desligar o computador?",
-                                        L"Fechar o jogo?"};
+            const wchar_t* actions[] = {L"Suspender o computador?", L"Reiniciar o computador?",
+                                        L"Desligar o computador?", L"Fechar o jogo?"};
             RECT question{width / 2 - 205, menuOffset() + 39,
                           width / 2 + 205, menuOffset() + 91};
             DrawTextW(dc, actions[settingsSelection_], -1, &question,
@@ -1186,7 +1493,8 @@ void OverlayWindow::draw(HDC dc) const {
         SelectObject(dc, oldBrush); SelectObject(dc, oldPen); SelectObject(dc, oldFont);
         DeleteObject(descriptionFont); DeleteObject(nameFont);
     }
-    const int centers[] = {width / 2 - 285, width / 2 - 95, width / 2 + 95, width / 2 + 285};
+    const int centers[] = {width / 2 - 380, width / 2 - 190, width / 2,
+                           width / 2 + 190, width / 2 + 380};
 
     if (screen_ == Screen::MainBar) {
         SYSTEMTIME localTime{};
@@ -1205,13 +1513,14 @@ void OverlayWindow::draw(HDC dc) const {
         DeleteObject(clockFont);
     }
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const COLORREF color = RGB(245, 246, 250);
         if (icons_[i].pixels.empty()) {
             if (i == 0) drawAchievementIcon(dc, centers[i], barTop() + 190, color);
             if (i == 1) drawVolumeIcon(dc, centers[i], barTop() + 190, color);
             if (i == 2) drawScreenshotIcon(dc, centers[i], barTop() + 190, color);
-            if (i == 3) drawSettingsIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 3) drawModsIcon(dc, centers[i], barTop() + 190, color);
+            if (i == 4) drawSettingsIcon(dc, centers[i], barTop() + 190, color);
         }
     }
 }
@@ -1222,7 +1531,7 @@ bool OverlayWindow::loadIcons() {
                                             static_cast<DWORD>(std::size(executablePath)));
     const auto directory = std::filesystem::path(std::wstring(executablePath, length)).parent_path();
     const wchar_t* filenames[] = {
-        L"trophy.png", L"volume.png", L"screenshot.png", L"settings.png",
+        L"trophy.png", L"volume.png", L"screenshot.png", L"wand.png", L"settings.png",
         L"x.png", L"y.png", L"b.png"
     };
     bool allLoaded = true;
@@ -1231,13 +1540,13 @@ bool OverlayWindow::loadIcons() {
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&factory)))) return false;
 
-    for (int index = 0; index < 7; ++index) {
-        IconImage& destination = index < 4 ? icons_[index] : buttonIcons_[index - 4];
+    for (int index = 0; index < 8; ++index) {
+        IconImage& destination = index < 5 ? icons_[index] : buttonIcons_[index - 5];
         IWICBitmapDecoder* decoder = nullptr;
         IWICBitmapFrameDecode* frame = nullptr;
         IWICBitmapScaler* scaler = nullptr;
         IWICFormatConverter* converter = nullptr;
-        const auto path = directory / L"assets" / (index < 4 ? L"icons" : L"buttons") / filenames[index];
+        const auto path = directory / L"assets" / (index < 5 ? L"icons" : L"buttons") / filenames[index];
         HRESULT result = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
                                                              WICDecodeMetadataCacheOnLoad, &decoder);
         if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
@@ -1245,7 +1554,7 @@ bool OverlayWindow::loadIcons() {
         if (SUCCEEDED(result)) result = frame->GetSize(&sourceWidth, &sourceHeight);
         UINT width = 1, height = 1;
         if (SUCCEEDED(result) && sourceWidth && sourceHeight) {
-            const double maximumSize = index < 4 ? 60.0 : 30.0;
+            const double maximumSize = index < 5 ? 60.0 : 30.0;
             const double scale = (std::min)(maximumSize / sourceWidth, maximumSize / sourceHeight);
             width = (std::max)(1u, static_cast<UINT>(sourceWidth * scale));
             height = (std::max)(1u, static_cast<UINT>(sourceHeight * scale));
@@ -1793,19 +2102,23 @@ void OverlayWindow::renderAndPresent() {
     if (screen_ == Screen::Volume) initializeSystemVolume();
     const int panelWidth = screen_ == Screen::Volume ? 464 :
                            screen_ == Screen::Settings ? 500 :
+                           screen_ == Screen::Mods ? 900 :
                            screen_ == Screen::Achievements ? kAchievementPanelWidth :
                            (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? 1100 :
-                           screen_ == Screen::Confirmation ? 430 : kVolumePanelWidth;
+                           screen_ == Screen::Confirmation ? 430 :
+                           screen_ == Screen::WandStartConfirmation ? 430 : kVolumePanelWidth;
     const int panelTop = screen_ == Screen::Volume ? sliderY() - 84 :
                          screen_ == Screen::Achievements ? 18 :
+                         screen_ == Screen::Mods ? 18 :
                          (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? 18 :
-                         screen_ == Screen::Settings ? menuOffset() - 28 :
-                         screen_ == Screen::Confirmation ? menuOffset() + 34 : sliderY() - 22;
+                         screen_ == Screen::Settings ? menuOffset() - 78 :
+                         (screen_ == Screen::Confirmation || screen_ == Screen::WandStartConfirmation) ? menuOffset() + 34 : sliderY() - 22;
     const int panelBottom = screen_ == Screen::Volume ? sliderY() + 22 :
                             screen_ == Screen::Achievements ? barTop() - 6 :
+                            screen_ == Screen::Mods ? barTop() - 6 :
                             (screen_ == Screen::Screenshots || screen_ == Screen::ScreenshotViewer) ? barTop() - 6 :
                             screen_ == Screen::Settings ? menuOffset() + 178 :
-                            screen_ == Screen::Confirmation ? menuOffset() + 159 : sliderY() + 22;
+                            (screen_ == Screen::Confirmation || screen_ == Screen::WandStartConfirmation) ? menuOffset() + 159 : sliderY() + 22;
     const int panelLeft = (frameWidth_ - panelWidth) / 2;
     const int panelRight = panelLeft + panelWidth;
     const int panelRadius = (std::min)(kVolumePanelRadius, (panelBottom - panelTop) / 2);
@@ -1989,9 +2302,10 @@ void OverlayWindow::renderAndPresent() {
         blendIcon(output, frameWidth_, gameIcon_, 116, barTop() + 190, 255);
 
     if (screen_ != Screen::ScreenshotViewer) {
-        const int iconCenters[] = {frameWidth_ / 2 - 285, frameWidth_ / 2 - 95,
-                                   frameWidth_ / 2 + 95, frameWidth_ / 2 + 285};
-        for (int index = 0; index < 4; ++index) {
+        const int iconCenters[] = {frameWidth_ / 2 - 380, frameWidth_ / 2 - 190,
+                                   frameWidth_ / 2, frameWidth_ / 2 + 190,
+                                   frameWidth_ / 2 + 380};
+        for (int index = 0; index < 5; ++index) {
             blendIcon(output, frameWidth_, icons_[index], iconCenters[index], barTop() + 190,
                       index == selectedItem_ ? 255 : 82);
         }
@@ -2043,7 +2357,7 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
                                  self->screen_ == Screen::Achievements ? 18 :
                                  (self->screen_ == Screen::Screenshots ||
                                   self->screen_ == Screen::ScreenshotViewer) ? 18 :
-                                 self->screen_ == Screen::Settings ? self->menuOffset() - 28 :
+                                 self->screen_ == Screen::Settings ? self->menuOffset() - 78 :
                                  self->screen_ == Screen::Confirmation ? self->menuOffset() + 34 : self->sliderY() - 22;
             const int panelBottom = self->screen_ == Screen::Volume ? self->sliderY() + 22 :
                                     self->screen_ == Screen::Achievements ? self->barTop() - 6 :
@@ -2110,6 +2424,32 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
                 self->syncVisibilityWithGame();
                 self->pollController();
                 const ULONGLONG now = GetTickCount64();
+                if (self->shown_ && self->screen_ == Screen::Mods && now >= self->nextWandTrainerCheck_) {
+                    self->nextWandTrainerCheck_ = now + 500;
+                    const bool active = WandIntegration::isTrainerActive(self->gamePid_);
+                    if (active != self->wandTrainerActive_) {
+                        self->wandTrainerActive_ = active;
+                        self->renderAndPresent();
+                    }
+                }
+                if (self->wandOperationInFlight_ && self->wandFuture_.valid() &&
+                    self->wandFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    WandLoadResult result = self->wandFuture_.get();
+                    WindowSearch gameSearch{self->gamePid_, nullptr};
+                    EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&gameSearch));
+                    if (gameSearch.result) focusWindow(gameSearch.result);
+                    if (result.success) {
+                        self->wandMods_ = std::move(result.mods);
+                        self->modSelection_ = std::clamp(self->modSelection_, 0,
+                            (std::max)(0, static_cast<int>(self->wandMods_.size()) - 1));
+                        self->wandStatus_.clear();
+                    } else {
+                        if (!self->wandRetainModsOnError_) self->wandMods_.clear();
+                        self->wandStatus_ = std::move(result.error);
+                    }
+                    self->wandOperationInFlight_ = false;
+                    if (self->shown_) self->renderAndPresent();
+                }
                 if (self->liveBlurInFlight_ &&
                     self->liveBlurFuture_.wait_for(std::chrono::milliseconds(0)) ==
                         std::future_status::ready) {
@@ -2150,14 +2490,18 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
         return 0;
     case WM_KEYDOWN:
         if (!self) return 0;
-        if (wParam == VK_LEFT) self->moveSelection(-1);
+        if (wParam == VK_LEFT && self->screen_ == Screen::Mods) self->adjustSelectedMod(-1);
+        else if (wParam == VK_RIGHT && self->screen_ == Screen::Mods) self->adjustSelectedMod(1);
+        else if (wParam == VK_LEFT) self->moveSelection(-1);
         else if (wParam == VK_RIGHT) self->moveSelection(1);
         else if (wParam == VK_UP && self->screen_ == Screen::Screenshots) self->moveSelection(-4);
         else if (wParam == VK_DOWN && self->screen_ == Screen::Screenshots) self->moveSelection(4);
         else if (wParam == VK_UP && (self->screen_ == Screen::Settings ||
-                                     self->screen_ == Screen::Achievements)) self->moveSelection(-1);
+                                     self->screen_ == Screen::Achievements ||
+                                     self->screen_ == Screen::Mods)) self->moveSelection(-1);
         else if (wParam == VK_DOWN && (self->screen_ == Screen::Settings ||
-                                       self->screen_ == Screen::Achievements)) self->moveSelection(1);
+                                       self->screen_ == Screen::Achievements ||
+                                       self->screen_ == Screen::Mods)) self->moveSelection(1);
         else if (wParam == 'Y') self->cycleAchievementFilter();
         else if (wParam == 'X') self->toggleHiddenAchievementDetails();
         else if (wParam == VK_RETURN || wParam == VK_SPACE) self->activateSelection();
@@ -2198,6 +2542,8 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
         } else if (self && self->screen_ == Screen::Screenshots) {
             self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -4 : 4);
+        } else if (self && self->screen_ == Screen::Mods) {
+            self->moveSelection(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1);
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -2241,10 +2587,34 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
                 return 0;
             }
             if (self->screen_ == Screen::Settings) {
-                if (y >= self->menuOffset() + 31 && y < self->menuOffset() + 181) {
-                    self->settingsSelection_ = std::clamp((y - (self->menuOffset() + 31)) / 50, 0, 2);
+                if (y >= self->menuOffset() - 19 && y < self->menuOffset() + 181) {
+                    self->settingsSelection_ = std::clamp((y - (self->menuOffset() - 19)) / 50, 0, 3);
                     self->renderAndPresent();
                     self->activateSelection();
+                }
+                return 0;
+            }
+            if (self->screen_ == Screen::Mods) {
+                if (!self->wandMods_.empty() && y >= 92 && y < self->barTop()) {
+                    const bool hadNotice = !self->wandStatus_.empty();
+                    const int visibleCount = (std::max)(1, (self->barTop() - (hadNotice ? 160 : 105)) / 52);
+                    const int first = std::clamp(self->modSelection_ - visibleCount / 2, 0,
+                        (std::max)(0, static_cast<int>(self->wandMods_.size()) - visibleCount));
+                    const int selected = first + (y - 92) / 52;
+                    self->wandStatus_.clear();
+                    if (selected < static_cast<int>(self->wandMods_.size())) {
+                        self->modSelection_ = selected; self->renderAndPresent(); self->activateSelection();
+                    }
+                }
+                return 0;
+            }
+            if (self->screen_ == Screen::WandStartConfirmation) {
+                if (y >= self->menuOffset() + 108 && y <= self->menuOffset() + 154) {
+                    const int center = self->frameWidth_ / 2;
+                    if (x >= center - 210 && x <= center - 10) self->wandConfirmationSelection_ = 0;
+                    else if (x >= center + 10 && x <= center + 210) self->wandConfirmationSelection_ = 1;
+                    else return 0;
+                    self->renderAndPresent(); self->activateSelection();
                 }
                 return 0;
             }
@@ -2263,9 +2633,8 @@ LRESULT CALLBACK OverlayWindow::windowProc(HWND window, UINT message, WPARAM wPa
             RECT client{};
             GetClientRect(window, &client);
             const int center = client.right / 2;
-            if (x >= center - 380 && x <= center + 380) {
-                self->selectedItem_ = x < center - 190 ? 0 : x < center ? 1 :
-                                      x < center + 190 ? 2 : 3;
+            if (x >= center - 475 && x <= center + 475) {
+                self->selectedItem_ = std::clamp((x - (center - 475)) / 190, 0, 4);
                 self->renderAndPresent();
                 self->activateSelection();
             }

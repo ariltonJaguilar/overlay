@@ -1,4 +1,6 @@
 E:/Desktop/overlay/build-x64/CMakeFiles/OverlayInputHook.dir
+E:/Desktop/overlay/build-x64/CMakeFiles/WandDiagnostic.dir
+E:/Desktop/overlay/build-x64/CMakeFiles/WandControlProbe.dir
 E:/Desktop/overlay/build-x64/CMakeFiles/GameOverlayManager.dir
 E:/Desktop/overlay/build-x64/CMakeFiles/Overlay.dir
 E:/Desktop/overlay/build-x64/CMakeFiles/INSTALL.dir

@@ -186,6 +186,14 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
       <Project>{5F83D25A-3909-3B61-962C-FAE2960A5C2A}</Project>
       <Name>OverlayInputHook</Name>
     </ProjectReference>
+    <ProjectReference Include="E:\Desktop\overlay\build-x64\WandControlProbe.vcxproj">
+      <Project>{0ADFA0E6-099A-3A10-9D13-1091D4225D0B}</Project>
+      <Name>WandControlProbe</Name>
+    </ProjectReference>
+    <ProjectReference Include="E:\Desktop\overlay\build-x64\WandDiagnostic.vcxproj">
+      <Project>{2828C4B2-2CE7-37C4-97F7-53C04AE34AE8}</Project>
+      <Name>WandDiagnostic</Name>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
